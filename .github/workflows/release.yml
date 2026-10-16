@@ -73,10 +73,11 @@ jobs:
 
           Proxies: `socks5h://127.0.0.1:9909` and `http://127.0.0.1:9910`.
 
-          Full documentation (English / فارسی / Русский), all options
-          (`--upstream`, `--share-lan`, `--account-file`, `--level`, …),
-          build instructions and legal notices:
-          https://github.com/FossilizedProgrammer/geph5-proxy/tree/master/binaries/geph5-proxy
+          Full documentation: [English](https://github.com/FossilizedProgrammer/geph5-proxy/blob/master/README.md) ·
+          [فارسی](https://github.com/FossilizedProgrammer/geph5-proxy/blob/master/README.fa.md) ·
+          [Русский](https://github.com/FossilizedProgrammer/geph5-proxy/blob/master/README.ru.md)
+          — all options (`--upstream`, `--share-lan`, `--account-file`, `--level`, …),
+          build instructions and legal notices.
 
           Unofficial derivative of [Geph5](https://github.com/geph-official/geph5) (MPL-2.0/ISC); not affiliated with the official Geph project.
           EOF
