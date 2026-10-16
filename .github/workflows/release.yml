@@ -56,10 +56,31 @@ jobs:
           mkdir -p out
           cp linux/geph5-proxy-linux-amd64 out/
           cp windows/geph5-proxy-windows-amd64.exe out/
-          cp binaries/geph5-proxy/README.md \
-             binaries/geph5-proxy/README.fa.md \
-             binaries/geph5-proxy/README.ru.md \
-             out/
+          cat > out/notes.md <<'EOF'
+          ## geph5-proxy (unofficial)
+
+          Standalone Geph5 client that serves a local **SOCKS5 + HTTP proxy** instead of a system-wide VPN.
+
+          ```bash
+          # Linux
+          chmod +x geph5-proxy-linux-amd64 && ./geph5-proxy-linux-amd64 signup
+          ./geph5-proxy-linux-amd64 run --country NL
+
+          # Windows
+          geph5-proxy-windows-amd64.exe signup
+          geph5-proxy-windows-amd64.exe run --country NL
+          ```
+
+          Proxies: `socks5h://127.0.0.1:9909` and `http://127.0.0.1:9910`.
+
+          Full documentation (English / فارسی / Русский), all options
+          (`--upstream`, `--share-lan`, `--account-file`, `--level`, …),
+          build instructions and legal notices:
+          https://github.com/FossilizedProgrammer/geph5-proxy/tree/master/binaries/geph5-proxy
+
+          Unofficial derivative of [Geph5](https://github.com/geph-official/geph5) (MPL-2.0/ISC); not affiliated with the official Geph project.
+          EOF
       - uses: softprops/action-gh-release@v2
         with:
-          files: out/*
+          files: out/geph5-proxy-*
+          body_path: out/notes.md
