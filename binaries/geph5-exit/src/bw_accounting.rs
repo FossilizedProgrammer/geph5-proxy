@@ -1,0 +1,183 @@
+use std::{
+    fmt::Debug,
+    sync::{Arc, atomic::AtomicU64},
+    time::Duration,
+    u64,
+};
+
+use async_event::Event;
+use base64::{Engine, prelude::BASE64_STANDARD_NO_PAD};
+use futures_concurrency::future::Race;
+use geph5_broker_protocol::BrokerClient;
+use mizaru2::{ClientToken, SingleUnblindedSignature};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+use crate::{CONFIG_FILE, broker::BrokerRpcTransport};
+
+/// Process the client-to-exit bandwidth accounting protocol.
+#[tracing::instrument]
+pub async fn bw_accounting_loop(account: BwAccount, stream: picomux::Stream) -> anyhow::Result<()> {
+    tracing::debug!("starting accounting loop!");
+    scopeguard::defer!(tracing::debug!("stopping accounting loop"));
+    let (read, mut write) = tokio::io::split(stream);
+    let mut read = BufReader::new(read);
+    let read_fut = async {
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            (&mut read).take(4096).read_line(&mut buf).await?;
+            let (token, sig): (ClientToken, SingleUnblindedSignature) =
+                stdcode::deserialize(&BASE64_STANDARD_NO_PAD.decode(buf.trim())?)?;
+            tracing::debug!("obtained token, crediting bandwidth");
+            account.credit_bw(token, sig).await;
+        }
+    };
+    let write_fut = async {
+        let mut last_bytes_left = u64::MAX;
+        loop {
+            let bytes_left = account
+                .change_event
+                .wait_until(|| {
+                    let bytes_left = account.bytes_left();
+                    if bytes_left != last_bytes_left {
+                        Some(bytes_left)
+                    } else {
+                        None
+                    }
+                })
+                .await;
+            tracing::trace!(bytes_left, "bytes left lol");
+            last_bytes_left = bytes_left;
+            write.write_all(&(bytes_left as u64).to_be_bytes()).await?;
+            // debounce
+            tokio::time::sleep(Duration::from_secs_f32(rand::random::<f32>() / 2.0)).await;
+        }
+    };
+    (read_fut, write_fut).race().await
+}
+
+#[derive(Clone)]
+pub struct BwAccount {
+    id: u64,
+    bytes_left: Arc<AtomicU64>,
+    change_event: Arc<Event>,
+}
+
+impl Debug for BwAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BwAccount").field("id", &self.id).finish()
+    }
+}
+
+static NEXT_FREE_ID: AtomicU64 = AtomicU64::new(0);
+
+impl BwAccount {
+    /// Create an unlimited BwAccount
+    pub fn unlimited() -> Self {
+        Self {
+            id: NEXT_FREE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            bytes_left: Arc::new(AtomicU64::new(u64::MAX)),
+            change_event: Default::default(),
+        }
+    }
+
+    /// Create an empty BwAccount
+    pub fn empty() -> Self {
+        Self {
+            id: NEXT_FREE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            bytes_left: Arc::new(AtomicU64::new(0)),
+            change_event: Default::default(),
+        }
+    }
+
+    /// Process a bandwidth token, crediting bandwidth as needed.
+    ///
+    /// Never returns an error for broker trouble: a transient broker failure
+    /// here used to kill the whole accounting loop, whose closed stream the
+    /// client then treated as session death — resetting every stream on an
+    /// otherwise-healthy session. Transient transport errors are retried a
+    /// few times; a persistently unreachable broker or a rejected token means
+    /// the credit is skipped (the client's balance stays low and it will
+    /// simply submit another token), but the loop lives on.
+    pub async fn credit_bw(&self, token: ClientToken, sig: SingleUnblindedSignature) {
+        if let Some(broker) = &CONFIG_FILE.wait().broker {
+            let client = BrokerClient(BrokerRpcTransport::new(&broker.url));
+            let mut delay = Duration::from_secs(1);
+            // Whether an earlier attempt reached the broker ambiguously: a
+            // transport error or timeout that may have committed the spend on
+            // the broker before its response was lost. `consume_bw_token` is at
+            // most once (the broker rejects a second submission of the same
+            // token), so if a later attempt comes back "already spent" *after*
+            // such an ambiguous failure, that rejection is our own earlier
+            // submission landing — not a replay — and we must still credit.
+            // Without this, every lost response silently burns a paid token.
+            let mut ambiguous_prior = false;
+            for attempt in 0..4 {
+                match client.consume_bw_token(token, sig.clone()).await {
+                    Ok(Ok(())) => break,
+                    Ok(Err(err)) => {
+                        if ambiguous_prior {
+                            // A prior attempt may have committed this token before
+                            // we lost its response; crediting completes that
+                            // at-most-once redemption rather than double-spending.
+                            tracing::debug!(
+                                err = debug(err),
+                                "bw token reported spent after an ambiguous retry; crediting our own earlier submission"
+                            );
+                            break;
+                        }
+                        // First clean contact with the broker rejected the token
+                        // (genuine double spend): retrying cannot help, and
+                        // crediting would be wrong.
+                        tracing::warn!(err = debug(err), "broker rejected bw token, not crediting");
+                        return;
+                    }
+                    Err(err) => {
+                        // Transport-level failure: the broker may just be having
+                        // a moment — but it may also have committed the spend
+                        // before we lost the response. Remember that, then retry.
+                        ambiguous_prior = true;
+                        if attempt == 3 {
+                            tracing::warn!(
+                                err = debug(err),
+                                "broker unreachable, skipping bw token credit"
+                            );
+                            return;
+                        }
+                        tracing::debug!(
+                            err = debug(err),
+                            attempt,
+                            "bw token redemption failed, retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay *= 2;
+                    }
+                }
+            }
+        };
+
+        self.bytes_left
+            .fetch_add(10_000_000, std::sync::atomic::Ordering::SeqCst);
+        self.change_event.notify_one();
+    }
+
+    /// Consumes bandwidth, returning the remaining bandwidth
+    pub fn consume_bw(&self, bytes: usize) -> u64 {
+        let res = self
+            .bytes_left
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |x| Some(x.saturating_sub(bytes as _)),
+            )
+            .unwrap();
+
+        self.change_event.notify_one();
+        res
+    }
+
+    /// Gets the current remaining bandwidth.
+    pub fn bytes_left(&self) -> u64 {
+        self.bytes_left.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}

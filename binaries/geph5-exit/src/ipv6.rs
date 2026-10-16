@@ -1,0 +1,353 @@
+use std::{
+    net::{Ipv6Addr, SocketAddr},
+    time::Duration,
+};
+
+use anyhow::Context;
+use blake3::Hasher;
+use futures_concurrency::future::RaceOk;
+use futures_util::{
+    future::{Either, select},
+    pin_mut,
+};
+use ipnet::Ipv6Net;
+use once_cell::sync::OnceCell;
+use rand::{Rng, seq::IteratorRandom};
+use tokio::net::{TcpSocket, TcpStream};
+use tokio::process::Command;
+
+use crate::{CONFIG_FILE, session::SessionKey};
+
+static IPV6_POOL: OnceCell<Vec<Ipv6Addr>> = OnceCell::new();
+const IPV6_HEAD_START: Duration = Duration::from_millis(350);
+
+/// Something that can be used for happy-eyeballs dialing, with its own IPv6 address.
+#[derive(Clone, Debug)]
+pub struct EyeballDialer {
+    inner: Option<Ipv6Addr>,
+}
+
+impl EyeballDialer {
+    /// Create a new eyeball dialer with a specific IPv6 address (or none).
+    pub fn new(ipv6_addr: Option<Ipv6Addr>) -> Self {
+        Self { inner: ipv6_addr }
+    }
+
+    /// Connect to a given remote.
+    pub async fn connect(&self, addrs: Vec<SocketAddr>) -> anyhow::Result<TcpStream> {
+        let my_addr = self.inner;
+        let addrs = pick_eyeball_addrs(addrs);
+
+        match (addrs.ipv6, addrs.ipv4) {
+            (None, None) => anyhow::bail!("no addresses given"),
+            (Some(addr), None) | (None, Some(addr)) => connect_one(my_addr, addr).await,
+            (Some(ipv6), Some(ipv4)) => connect_dual_stack(my_addr, ipv6, ipv4).await,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EyeballAddrs {
+    ipv6: Option<SocketAddr>,
+    ipv4: Option<SocketAddr>,
+}
+
+fn pick_eyeball_addrs(addrs: Vec<SocketAddr>) -> EyeballAddrs {
+    let mut rng = rand::rng();
+
+    EyeballAddrs {
+        ipv6: addrs
+            .iter()
+            .filter(|addr| addr.is_ipv6())
+            .choose(&mut rng)
+            .copied(),
+        ipv4: addrs
+            .iter()
+            .filter(|addr| addr.is_ipv4())
+            .choose(&mut rng)
+            .copied(),
+    }
+}
+
+async fn connect_dual_stack(
+    my_addr: Option<Ipv6Addr>,
+    ipv6: SocketAddr,
+    ipv4: SocketAddr,
+) -> anyhow::Result<TcpStream> {
+    let ipv6_connect = connect_one(my_addr, ipv6);
+    let head_start = tokio::time::sleep(IPV6_HEAD_START);
+    pin_mut!(ipv6_connect);
+    pin_mut!(head_start);
+
+    match select(ipv6_connect, head_start).await {
+        Either::Left((Ok(stream), _)) => Ok(stream),
+        Either::Left((Err(ipv6_err), _)) => {
+            tracing::debug!(
+                err = debug(&ipv6_err),
+                addr = display(ipv6),
+                fallback_addr = display(ipv4),
+                "IPv6 connect failed before head start elapsed; trying IPv4 immediately"
+            );
+            connect_one(my_addr, ipv4)
+                .await
+                .with_context(|| format!("IPv6 connect failed first: {ipv6_err:?}"))
+        }
+        Either::Right((_, ipv6_connect)) => {
+            tracing::debug!(
+                addr = display(ipv6),
+                fallback_addr = display(ipv4),
+                head_start_ms = IPV6_HEAD_START.as_millis(),
+                "IPv6 head start elapsed; racing IPv4 fallback"
+            );
+            (ipv6_connect, connect_one(my_addr, ipv4))
+                .race_ok()
+                .await
+                .map_err(|errors| {
+                    anyhow::anyhow!(
+                        "both IPv6 and IPv4 connects failed: IPv6: {:?}; IPv4: {:?}",
+                        errors[0],
+                        errors[1]
+                    )
+                })
+        }
+    }
+}
+
+async fn connect_one(my_addr: Option<Ipv6Addr>, addr: SocketAddr) -> anyhow::Result<TcpStream> {
+    if addr.is_ipv6()
+        && let Some(my_addr) = my_addr
+    {
+        return connect_from(my_addr, addr).await;
+    }
+    Ok(TcpStream::connect(addr).await?)
+}
+
+/// Pick a deterministic IPv6 from the pool for a session using rendezvous hashing.
+pub fn eyeball_addr_for_session(session_key: SessionKey) -> Option<Ipv6Addr> {
+    let pool = IPV6_POOL.get()?;
+    if pool.is_empty() {
+        return None;
+    }
+
+    let key_bytes = session_key.as_u128().to_le_bytes();
+    let mut best: Option<(u64, Ipv6Addr)> = None;
+    for addr in pool {
+        let mut hasher = Hasher::new();
+        hasher.update(&key_bytes);
+        hasher.update(&addr.octets());
+        let hash = hasher.finalize();
+        let weight = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
+        match best {
+            None => best = Some((weight, *addr)),
+            Some((best_weight, _)) if weight > best_weight => best = Some((weight, *addr)),
+            _ => {}
+        }
+    }
+    best.map(|(_, addr)| addr)
+}
+
+/// Given an `Ipv6Net`, generate a random IPv6 address within that subnet.
+fn random_ipv6_in_net(net: Ipv6Net) -> Ipv6Addr {
+    let prefix_len = net.prefix_len();
+
+    // The number of bits we can randomize:
+    let host_bits = 128 - prefix_len;
+
+    // Convert the network address to a u128 (big-endian).
+    let network_u128 = u128::from_be_bytes(net.network().octets());
+
+    // Maximum number of addresses in this subnet = 2^(host_bits).
+    // We'll generate a random offset in [0, 2^host_bits).
+    let max_offset = if host_bits == 0 {
+        // If the prefix is /128, there's only one address in the subnet (no offset).
+        0
+    } else {
+        (1u128 << host_bits) - 1
+    };
+    let random_offset = if max_offset == 0 {
+        0
+    } else {
+        rand::rng().random_range(0..=max_offset)
+    };
+
+    // Our randomly chosen address is (network_address + random_offset).
+    let addr_u128 = network_u128 + random_offset;
+    let addr_octets = addr_u128.to_be_bytes();
+    Ipv6Addr::from(addr_octets)
+}
+
+/// Connect to a remote IPv6 address using the given IPv6 address.
+async fn connect_from(from: Ipv6Addr, remote: SocketAddr) -> anyhow::Result<TcpStream> {
+    tracing::debug!(
+        from = display(from),
+        remote = display(remote),
+        "connecting from an ephemeral IPv6"
+    );
+    let socket = TcpSocket::new_v6()?;
+    socket.set_reuseaddr(true)?;
+    let local_addr = SocketAddr::new(std::net::IpAddr::V6(from), 0);
+    socket.bind(local_addr).context("cannot bind")?;
+    let stream = socket
+        .connect(remote)
+        .await
+        .context("cannot finish connect")?;
+    Ok(stream)
+}
+
+pub async fn configure_ipv6_routing() -> anyhow::Result<()> {
+    let cfg = CONFIG_FILE.wait();
+    let range = cfg.ipv6_subnet;
+    if range == Ipv6Net::default() {
+        IPV6_POOL.set(Vec::new()).ok();
+        return Ok(());
+    }
+    let iface = detect_ipv6_interface().await?;
+    let pool = ensure_ipv6_pool(range, cfg.ipv6_pool_size, &iface).await?;
+    IPV6_POOL.set(pool).ok();
+    Ok(())
+}
+
+async fn ensure_ipv6_pool(
+    range: Ipv6Net,
+    desired: usize,
+    iface: &str,
+) -> anyhow::Result<Vec<Ipv6Addr>> {
+    let mut pool = existing_ipv6_addresses(range, iface).await?;
+    while pool.len() < desired {
+        let candidate = random_ipv6_in_net(range);
+        if pool.contains(&candidate) {
+            continue;
+        }
+        Command::new("ip")
+            .arg("-6")
+            .arg("addr")
+            .arg("add")
+            .arg(format!("{}/128", candidate))
+            .arg("dev")
+            .arg(iface)
+            .output()
+            .await?;
+        pool.push(candidate);
+    }
+    Ok(pool)
+}
+
+async fn existing_ipv6_addresses(range: Ipv6Net, iface: &str) -> anyhow::Result<Vec<Ipv6Addr>> {
+    let output = Command::new("ip")
+        .args(["-6", "addr", "show", "dev", iface])
+        .output()
+        .await?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut addrs = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if !line.starts_with("inet6 ") {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        parts.next();
+        if let Some(addr_part) = parts.next()
+            && let Some(addr_str) = addr_part.split('/').next()
+            && let Ok(addr) = addr_str.parse::<Ipv6Addr>()
+            && range.contains(&addr)
+            && !addrs.contains(&addr)
+        {
+            addrs.push(addr);
+        }
+    }
+    Ok(addrs)
+}
+
+async fn detect_ipv6_interface() -> anyhow::Result<String> {
+    let output = Command::new("ip").args(["-6", "route"]).output().await?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+
+    // Find the default route
+    let default_route = stdout
+        .lines()
+        .find(|line| line.starts_with("default"))
+        .context("No default IPv6 route found")?;
+
+    // Extract the interface name
+    let iface = default_route
+        .split_whitespace()
+        .nth(4)
+        .context("Unable to parse interface name from default route")?;
+
+    Ok(iface.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ipnet::Ipv6Net;
+
+    #[test]
+    fn test_random_ipv6_in_net_basic() {
+        // Given a /64
+        let cidr_str = "2001:db8::/64";
+        let net: Ipv6Net = cidr_str.parse().expect("Failed to parse IPv6 CIDR");
+
+        // When we generate a random address
+        let addr = random_ipv6_in_net(net);
+
+        // Then the address should be contained within that net
+        // ipnet’s `contains()` checks if the address is in the subnet range
+        assert!(net.contains(&addr), "Generated address not in the subnet");
+    }
+
+    #[test]
+    fn test_random_ipv6_in_net_small_prefix() {
+        // Given a /120 (just 8 host bits)
+        let cidr_str = "2001:db8::/120";
+        let net: Ipv6Net = cidr_str.parse().expect("Failed to parse IPv6 CIDR");
+
+        let addr = random_ipv6_in_net(net);
+        assert!(net.contains(&addr), "Generated address not in the subnet");
+    }
+
+    #[test]
+    fn test_random_ipv6_in_net_full_address() {
+        // Given /128 => only one valid host in the subnet
+        let cidr_str = "2001:db8::/128";
+        let net: Ipv6Net = cidr_str.parse().expect("Failed to parse IPv6 CIDR");
+
+        let addr = random_ipv6_in_net(net);
+
+        // There's only one possible address: 2001:db8::
+        assert_eq!(
+            addr,
+            net.network(),
+            "Should be exactly the single /128 address"
+        );
+    }
+
+    #[test]
+    fn pick_eyeball_addrs_uses_at_most_one_per_family() {
+        let addrs = vec![
+            "[2001:db8::1]:443".parse().unwrap(),
+            "[2001:db8::2]:443".parse().unwrap(),
+            "192.0.2.1:443".parse().unwrap(),
+            "192.0.2.2:443".parse().unwrap(),
+        ];
+
+        let picked = pick_eyeball_addrs(addrs);
+
+        assert!(picked.ipv6.is_some_and(|addr| addr.is_ipv6()));
+        assert!(picked.ipv4.is_some_and(|addr| addr.is_ipv4()));
+    }
+
+    #[test]
+    fn pick_eyeball_addrs_handles_single_family() {
+        let addrs = vec![
+            "192.0.2.1:443".parse().unwrap(),
+            "192.0.2.2:443".parse().unwrap(),
+        ];
+
+        let picked = pick_eyeball_addrs(addrs);
+
+        assert_eq!(picked.ipv6, None);
+        assert!(picked.ipv4.is_some_and(|addr| addr.is_ipv4()));
+    }
+}

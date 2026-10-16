@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build (static)
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p geph5-proxy
+      - name: Package
+        run: |
+          strip target/x86_64-unknown-linux-musl/release/geph5-proxy
+          cp target/x86_64-unknown-linux-musl/release/geph5-proxy geph5-proxy-linux-amd64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: geph5-proxy-linux-amd64
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked -p geph5-proxy
+      - name: Package
+        shell: bash
+        run: cp target/release/geph5-proxy.exe geph5-proxy-windows-amd64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: geph5-proxy-windows-amd64.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+      - name: Collect release files
+        run: |
+          mkdir -p out
+          cp linux/geph5-proxy-linux-amd64 out/
+          cp windows/geph5-proxy-windows-amd64.exe out/
+          cp binaries/geph5-proxy/README.md \
+             binaries/geph5-proxy/README.fa.md \
+             binaries/geph5-proxy/README.ru.md \
+             out/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*

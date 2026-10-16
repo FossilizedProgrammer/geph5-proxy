@@ -1,0 +1,73 @@
+[package]
+name = "geph5-app"
+edition = "2024"
+license = "MPL-2.0"
+description = "The Geph5 desktop app: the `geph` CLI and its supervising daemon"
+version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "geph5"
+path = "src/main.rs"
+
+[dependencies]
+geph5-broker-protocol = { version = "0.4.3", path = "../../libraries/geph5-broker-protocol" }
+geph5-misc-rpc = { version = "0.4.3", path = "../../libraries/geph5-misc-rpc" }
+geph5-rt = { version = "0.3.8", path = "../../libraries/geph5-rt" }
+
+nanorpc = "0.1.13"
+nanorpc-sillad = { version = "0.2.2", path = "../../libraries/nanorpc-sillad" }
+sillad = { version = "0.3.3", path = "../../libraries/sillad" }
+
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+blake3 = "1.8.7"
+clap = { version = "4.6.6", features = ["derive"] }
+isocountry = "0.3.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.151"
+serde_yaml = "0.9.34"
+scopeguard = "1.2.0"
+thiserror = "1.0.69"
+tokio = { version = "1.53", features = ["sync", "signal", "macros"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
+url = "2"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+system-configuration-sys = "0.6.0"
+system-configuration = "0.6.1"
+pfctl = "0.7"
+ipnetwork = "0.21"
+
+[target.'cfg(windows)'.dependencies]
+wintun = "0.5"
+windows-service = "0.8.1"
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_TaskScheduler",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Rpc",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Registry",
+    "Win32_Networking_WinInet",
+    "Win32_System_JobObjects",
+] }

@@ -1,0 +1,35 @@
+[package]
+name = "sillad-meeklike"
+edition = "2024"
+version = "0.2.2"
+description = "A meek-like HTTP polling protocol within the sillad framework"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+async-channel = "2.5.0"
+async-trait = "0.1.92"
+base64 = "0.22.1"
+blake3 = "1.8.7"
+bytes = "1.12.1"
+chacha20poly1305 = {version="0.10.1", features=["reduced-round"]}
+dashmap = "5.5.3"
+event-listener = "5.4.2"
+futures-concurrency = "7.7.1"
+geph5-rt = { version = "0.3.8", path = "../geph5-rt" }
+hex = "0.4.3"
+http-body-util = "0.1.5"
+hyper = { version = "1.11.1", features = ["http1", "client", "server"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+parking_lot = "0.12.5"
+pin-project = "1.1.13"
+rand = "0.9.5"
+scopeguard = "1.2.0"
+serde = { version = "1", features = ["derive"] }
+sillad = { version = "0.3.3", path = "../sillad" }
+stdcode = "0.1.14"
+tokio = { version = "1.53", features = ["io-util", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tracing = "0.1.44"
+virta = "0.1.2"

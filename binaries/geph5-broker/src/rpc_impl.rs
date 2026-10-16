@@ -1,0 +1,1349 @@
+use anyhow::Context;
+use async_trait::async_trait;
+use bytes::Bytes;
+use ed25519_dalek::VerifyingKey;
+use futures_util::{TryFutureExt, future::join_all};
+use geph5_broker_protocol::{
+    AccountLevel, AccountSecretError, AccountSecretStatus, AuthError, AvailabilityData,
+    BridgeDescriptor, BrokerProtocol, BrokerService, Credential, DOMAIN_EXIT_DESCRIPTOR,
+    DOMAIN_EXIT_ROUTE, DOMAIN_NET_STATUS, ExitCategory, ExitConstraint, ExitDescriptor, ExitList,
+    ExitMetadata, ExitRouteDescriptor, GenericError, GetExitRouteArgs, GetRoutesArgs, JsonSigned,
+    LegacyNewsItem, Mac, NetStatus, RouteDescriptor, StatEvent, StdcodeSigned, UserInfo,
+    VoucherInfo,
+};
+use geph5_ip_to_asn::ip_to_asn_country;
+use geph5_rt::TimeoutExt;
+use geph5_stats::StatsdUdpSink;
+use isocountry::CountryCode;
+use mizaru2::{
+    BlindedClientToken, BlindedSignature, ClientToken, SingleBlindedSignature,
+    SingleUnblindedSignature, UnblindedSignature,
+};
+use moka::future::Cache;
+use nanorpc::{JrpcRequest, JrpcResponse, RpcService, RpcTransport, ServerError};
+use once_cell::sync::Lazy;
+
+use std::sync::LazyLock;
+use std::sync::atomic::AtomicU64;
+use std::{
+    net::{IpAddr, SocketAddr},
+    ops::Deref,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use crate::BW_MIZARU_SK;
+use crate::bridge_filter::filter_raw_bridge_descriptors;
+use crate::database::auth::validate_secret;
+use crate::database::{
+    auth::{
+        self, get_user_info, issue_auth_token, register_secret, valid_auth_token,
+        validate_credential,
+    },
+    bandwidth::consume_bw,
+    bridges::query_bridges,
+    exits::{ExitRow, ExitRowWithMetadata, insert_exit, insert_exit_metadata},
+    free_voucher::{delete_free_voucher, get_free_voucher},
+    puzzle::{new_puzzle, verify_puzzle_solution},
+};
+use crate::{
+    CONFIG_FILE, FREE_MIZARU_SK, MASTER_SECRET, PLUS_MIZARU_SK,
+    bridge_to_route::bridge_to_leaf_route,
+    news::fetch_news,
+    payments::{
+        GiftcardWireInfo, PaymentClient, PaymentTransport, StartAliwechatArgs, StartStripeArgs,
+        payment_sessid,
+    },
+};
+
+pub struct WrappedBrokerService(BrokerService<BrokerImpl>);
+
+impl WrappedBrokerService {
+    pub fn new() -> Self {
+        Self(BrokerService(BrokerImpl {}))
+    }
+}
+
+#[async_trait]
+impl RpcService for WrappedBrokerService {
+    async fn respond(
+        &self,
+        method: &str,
+        params: Vec<serde_json::Value>,
+    ) -> Option<Result<serde_json::Value, ServerError>> {
+        if rand::random::<f64>() < 0.01 {
+            tracing::debug!(method, "calling respond()");
+        }
+        let start = Instant::now();
+        let resp = self.0.respond(method, params).await?;
+        if let Some(sink) = STATS_SINK.as_ref() {
+            sink.send_one(&StatEvent::timer_ms(
+                "broker_rpc_calls",
+                &[("method", method)],
+                start.elapsed().as_secs_f64() * 1000.0,
+            ));
+        }
+        Some(resp)
+    }
+}
+
+struct BrokerImpl {}
+
+impl BrokerImpl {
+    async fn create_payment_inner(
+        &self,
+        secret: String,
+        days: u32,
+        method: String,
+        item: crate::payments::Item,
+    ) -> Result<String, GenericError> {
+        let user_id = validate_secret(&secret).await?;
+        static CACHE: LazyLock<Cache<(i32, u32, String, crate::payments::Item), String>> =
+            LazyLock::new(|| {
+                Cache::builder()
+                    .time_to_live(Duration::from_secs(10))
+                    .build()
+            });
+
+        let cache_key = (user_id, days, method.clone(), item.clone());
+        let url = CACHE
+            .try_get_with(cache_key, async move {
+                let (method, promo) = method.split_once("+++").unwrap_or_else(|| (&method, ""));
+                let method = method.to_string();
+                let promo = promo.to_string();
+                let rpc = PaymentClient(PaymentTransport);
+                let sessid = payment_sessid(user_id).await?;
+                match method.as_str() {
+                    "credit-card" => Ok(rpc
+                        .start_stripe_url(
+                            sessid,
+                            StartStripeArgs {
+                                promo,
+                                days: days as _,
+                                item,
+                                is_recurring: true,
+                            },
+                        )
+                        .await?
+                        .map_err(GenericError)?),
+                    "wechat" => Ok(rpc
+                        .start_aliwechat(
+                            sessid,
+                            StartAliwechatArgs {
+                                promo,
+                                days: days as _,
+                                item,
+                                method: method.to_string(),
+                                mobile: false,
+                            },
+                        )
+                        .await?
+                        .map_err(GenericError)?),
+                    "alipay" => Ok(rpc
+                        .start_aliwechat(
+                            sessid,
+                            StartAliwechatArgs {
+                                promo,
+                                days: days as _,
+                                item,
+                                method: method.to_string(),
+                                mobile: false,
+                            },
+                        )
+                        .await?
+                        .map_err(GenericError)?),
+                    _ => Err(GenericError("no support for this method here".to_string())),
+                }
+            })
+            .await
+            .map_err(|e: Arc<GenericError>| e.deref().clone())?;
+        Ok(url)
+    }
+
+    async fn net_status_inner(&self) -> Result<NetStatus, GenericError> {
+        static CACHE: Lazy<Cache<(), NetStatus>> = Lazy::new(|| {
+            Cache::builder()
+                .time_to_live(Duration::from_secs(10))
+                .build()
+        });
+
+        let ns = CACHE
+            .try_get_with((), async {
+                let exits: Vec<ExitRowWithMetadata> =
+                    crate::database::exits::list_with_metadata().await?;
+                let exits = exits
+                    .into_iter()
+                    .map(|row| {
+                        let vk = VerifyingKey::from_bytes(&row.pubkey).unwrap();
+                        let desc = ExitDescriptor {
+                            c2e_listen: row.c2e_listen.parse().unwrap(),
+                            b2e_listen: row.b2e_listen.parse().unwrap(),
+                            country: CountryCode::for_alpha2_caseless(&row.country).unwrap(),
+                            city: row.city,
+                            load: row.load,
+                            expiry: row.expiry as _,
+                        };
+                        let meta = row
+                            .metadata
+                            .map(|j| j.0)
+                            .unwrap_or_else(|| default_exit_metadata(&desc.country));
+                        (hex::encode(vk.as_bytes()), (vk, desc, meta))
+                    })
+                    .collect();
+                Ok(NetStatus { exits })
+            })
+            .await
+            .map_err(|e: Arc<GenericError>| e.deref().clone())?;
+        Ok(ns)
+    }
+}
+
+fn default_exit_metadata(country: &CountryCode) -> ExitMetadata {
+    let mut allowed_levels = vec![AccountLevel::Plus];
+    if matches!(
+        country,
+        CountryCode::CAN
+            | CountryCode::NLD
+            | CountryCode::FRA
+            | CountryCode::POL
+            | CountryCode::DEU
+    ) {
+        allowed_levels.push(AccountLevel::Free);
+    }
+    ExitMetadata {
+        allowed_levels,
+        category: ExitCategory::Core,
+    }
+}
+
+fn authenticate_account_level(
+    token: ClientToken,
+    sig: &UnblindedSignature,
+) -> Result<AccountLevel, GenericError> {
+    if PLUS_MIZARU_SK
+        .to_public_key()
+        .blind_verify(token, sig)
+        .is_ok()
+    {
+        Ok(AccountLevel::Plus)
+    } else {
+        FREE_MIZARU_SK.to_public_key().blind_verify(token, sig)?;
+        Ok(AccountLevel::Free)
+    }
+}
+
+async fn parse_client_location(
+    client_metadata: &serde_json::Value,
+) -> Result<(u32, String), GenericError> {
+    if let Some(ip_addr) = parse_client_ip(client_metadata) {
+        ip_to_asn_country(ip_addr).await.map_err(Into::into)
+    } else {
+        Ok((0, "".to_string()))
+    }
+}
+
+fn parse_client_ip(client_metadata: &serde_json::Value) -> Option<IpAddr> {
+    client_metadata["ip_addr"]
+        .as_str()
+        .and_then(|ip_addr| ip_addr.parse().ok())
+}
+
+fn select_exit_with_constraint(
+    rendezvous_key: blake3::Hash,
+    constraint: &ExitConstraint,
+    level: AccountLevel,
+    net_status: &NetStatus,
+) -> Result<(VerifyingKey, ExitDescriptor), GenericError> {
+    if matches!(constraint, ExitConstraint::Direct(_)) {
+        return Err(GenericError(
+            "direct constraints must not be sent to the broker".into(),
+        ));
+    }
+
+    let mut country_constraint = None;
+    let mut city_constraint = None;
+    let mut hostname_constraint = None;
+
+    match constraint {
+        ExitConstraint::Hostname(host) => hostname_constraint = Some(host.as_str()),
+        ExitConstraint::Country(country) => country_constraint = Some(*country),
+        ExitConstraint::CountryCity(country, city) => {
+            country_constraint = Some(*country);
+            city_constraint = Some(city.as_str());
+        }
+        ExitConstraint::Auto => {}
+        ExitConstraint::Direct(_) => unreachable!(),
+    }
+
+    let filtered: Vec<_> = net_status
+        .exits
+        .values()
+        .filter(|(_, exit, meta)| {
+            let mut pass = country_constraint.is_none_or(|country| exit.country == country);
+            pass &= city_constraint.is_none_or(|city| exit.city == city);
+            pass &= hostname_constraint
+                .is_none_or(|hostname| exit.b2e_listen.ip().to_string() == hostname);
+            if matches!(constraint, ExitConstraint::Auto) {
+                pass &= meta.category == ExitCategory::Core;
+            }
+            pass &= meta.allowed_levels.contains(&level);
+            pass
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        return Err(GenericError("no exits match the constraints".into()));
+    }
+
+    let (pubkey, exit, _) = filtered
+        .into_iter()
+        .min_by(|(_, left, _), (_, right, _)| {
+            exit_rendezvous_score(rendezvous_key, left)
+                .total_cmp(&exit_rendezvous_score(rendezvous_key, right))
+        })
+        .unwrap();
+    Ok((*pubkey, exit.clone()))
+}
+
+fn exit_rendezvous_score(rendezvous_key: blake3::Hash, exit: &ExitDescriptor) -> f64 {
+    let hash = blake3::keyed_hash(
+        rendezvous_key.as_bytes(),
+        exit.b2e_listen.ip().to_string().as_bytes(),
+    );
+    let hash =
+        u64::from_be_bytes(hash.as_bytes()[..8].try_into().unwrap()) as f64 / u64::MAX as f64;
+    let weight = (1.0 - (exit.load as f64)).powi(2);
+    -hash.ln() / weight
+}
+
+/// How long the broker waits for a TCP connection when sanity-checking an exit's listeners.
+const EXIT_SANITY_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether `ip` is a public, globally-routable unicast address. The exit
+/// sanity-check dials addresses that the (semi-trusted) exit fully controls, so
+/// anything that is not public — loopback, private/RFC1918, CGNAT, link-local,
+/// ULA, multicast, unspecified — must be refused. Otherwise a malicious exit
+/// could aim the broker's connect at internal services (SSRF).
+fn is_public_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                // 100.64.0.0/10 (CGNAT / RFC 6598)
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
+                // 0.0.0.0/8 (this network)
+                || v4.octets()[0] == 0)
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_multicast()
+                || v6.is_unspecified()
+                // fc00::/7 unique-local
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // fe80::/10 link-local
+                || (v6.segments()[0] & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// Minimally sanity-check that an exit is actually reachable before adding it to the list, by
+/// opening a plain TCP connection to each of its advertised listening ports. Returns an error if
+/// any of them cannot be connected to, so a broken or unreachable exit never makes it into the DB.
+async fn sanity_check_exit(descriptor: &ExitDescriptor) -> Result<(), GenericError> {
+    for (label, addr) in [
+        ("c2e_listen", descriptor.c2e_listen),
+        ("b2e_listen", descriptor.b2e_listen),
+    ] {
+        if !is_public_routable(addr.ip()) {
+            return Err(GenericError(format!(
+                "exit {label} at {addr} is not a publicly-routable address; refusing to connect"
+            )));
+        }
+        match tokio::net::TcpStream::connect(addr)
+            .timeout(EXIT_SANITY_CHECK_TIMEOUT)
+            .await
+        {
+            Some(Ok(_stream)) => {
+                tracing::debug!(%addr, "exit {label} passed sanity check");
+            }
+            Some(Err(err)) => {
+                return Err(GenericError(format!(
+                    "exit {label} at {addr} refused TCP connection: {err}"
+                )));
+            }
+            None => {
+                return Err(GenericError(format!(
+                    "exit {label} at {addr} did not accept a TCP connection within {}s",
+                    EXIT_SANITY_CHECK_TIMEOUT.as_secs()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn find_exit_by_b2e(exit_b2e: SocketAddr) -> Result<ExitDescriptor, GenericError> {
+    BrokerImpl {}
+        .net_status_inner()
+        .await?
+        .exits
+        .into_values()
+        .map(|(_, descriptor, _)| descriptor)
+        .find(|descriptor| descriptor.b2e_listen == exit_b2e)
+        .context("cannot find this exit")
+        .map_err(Into::into)
+}
+
+async fn build_route_for_exit(
+    token: ClientToken,
+    account_level: AccountLevel,
+    exit: &ExitDescriptor,
+    client_metadata: &serde_json::Value,
+) -> Result<RouteDescriptor, GenericError> {
+    let (asn, country) = parse_client_location(client_metadata).await?;
+
+    for attempt in 0u64.. {
+        let raw_descriptors = query_bridges(&format!("{:?}-{attempt}", token)).await?;
+        let raw_descriptors =
+            filter_raw_bridge_descriptors(raw_descriptors, account_level, &country);
+        if raw_descriptors.is_empty() {
+            if attempt < 10 {
+                tracing::warn!(
+                    attempt,
+                    asn,
+                    country,
+                    "EMPTY descriptor list, retrying with a new key..."
+                );
+                continue;
+            } else {
+                return Err(GenericError("no bridges available".into()));
+            }
+        }
+
+        let version = client_metadata["version"]
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let mut routes = vec![];
+        for route in (join_all(raw_descriptors.into_iter().map(|meta| {
+            let bridge = meta.descriptor.control_listen;
+            let exit_b2e = exit.b2e_listen;
+            let pool = meta.descriptor.pool.clone();
+            bridge_to_leaf_route(
+                meta.descriptor,
+                meta.delay_ms,
+                exit,
+                &country,
+                asn,
+                &version,
+            )
+            .inspect_err(move |err| {
+                tracing::warn!(
+                    err = debug(err),
+                    bridge = debug(bridge),
+                    exit = debug(exit_b2e),
+                    "failed to call bridge_to_leaf_route"
+                )
+            })
+            .map_ok(move |route| (pool, route))
+        }))
+        .await)
+            .into_iter()
+            .flatten()
+        {
+            routes.push(route);
+        }
+        return Ok(RouteDescriptor::Race(group_ipv6_fallback_routes(routes)));
+    }
+
+    unreachable!()
+}
+
+const IPV6_POOL_SUFFIX: &str = "_ipv6";
+const IPV6_FALLBACK_TIMEOUT_MS: u32 = 5000;
+
+struct BridgePoolRoutes {
+    base_pool: String,
+    ipv4: Vec<RouteDescriptor>,
+    ipv6: Vec<RouteDescriptor>,
+}
+
+fn group_ipv6_fallback_routes(routes: Vec<(String, RouteDescriptor)>) -> Vec<RouteDescriptor> {
+    let mut groups: Vec<BridgePoolRoutes> = Vec::new();
+
+    for (pool, route) in routes {
+        let (base_pool, is_ipv6) = split_ipv6_pool(&pool);
+        let base_pool = base_pool.to_string();
+
+        let group = match groups.iter_mut().find(|group| group.base_pool == base_pool) {
+            Some(group) => group,
+            None => {
+                groups.push(BridgePoolRoutes {
+                    base_pool,
+                    ipv4: Vec::new(),
+                    ipv6: Vec::new(),
+                });
+                groups.last_mut().unwrap()
+            }
+        };
+
+        if is_ipv6 {
+            group.ipv6.push(route);
+        } else {
+            group.ipv4.push(route);
+        }
+    }
+
+    groups
+        .into_iter()
+        .filter_map(|group| {
+            let ipv6 = combine_family_routes(group.ipv6);
+            let ipv4 = combine_family_routes(group.ipv4);
+            match (ipv6, ipv4) {
+                (Some(ipv6), Some(ipv4)) => Some(RouteDescriptor::Fallback(vec![
+                    RouteDescriptor::Timeout {
+                        milliseconds: IPV6_FALLBACK_TIMEOUT_MS,
+                        lower: ipv6.into(),
+                    },
+                    ipv4,
+                ])),
+                (Some(ipv6), None) => Some(ipv6),
+                (None, Some(ipv4)) => Some(ipv4),
+                (None, None) => None,
+            }
+        })
+        .collect()
+}
+
+fn split_ipv6_pool(pool: &str) -> (&str, bool) {
+    match pool.strip_suffix(IPV6_POOL_SUFFIX) {
+        Some(base_pool) => (base_pool, true),
+        None => (pool, false),
+    }
+}
+
+fn combine_family_routes(mut routes: Vec<RouteDescriptor>) -> Option<RouteDescriptor> {
+    if routes.len() == 1 {
+        routes.pop()
+    } else if routes.is_empty() {
+        None
+    } else {
+        Some(RouteDescriptor::Race(routes))
+    }
+}
+
+#[async_trait]
+impl BrokerProtocol for BrokerImpl {
+    async fn opaque_abtest(&self, test: String, id: u64) -> bool {
+        test == "basic"
+    }
+
+    async fn get_mizaru_subkey(&self, level: AccountLevel, epoch: u16) -> Bytes {
+        match level {
+            AccountLevel::Free => &FREE_MIZARU_SK,
+            AccountLevel::Plus => &PLUS_MIZARU_SK,
+        }
+        .get_subkey(epoch)
+        .public_key()
+        .unwrap()
+        .to_der()
+        .unwrap()
+        .into()
+    }
+
+    async fn get_auth_token(&self, credential: Credential) -> Result<String, AuthError> {
+        issue_auth_token(credential).await
+    }
+
+    async fn get_account_secret_status(
+        &self,
+        secret: String,
+    ) -> Result<AccountSecretStatus, AccountSecretError> {
+        auth::get_account_secret_status(&secret).await
+    }
+
+    async fn rotate_account_secret(
+        &self,
+        current_secret: String,
+    ) -> Result<String, AccountSecretError> {
+        auth::rotate_account_secret(&current_secret).await
+    }
+
+    async fn get_bw_token(
+        &self,
+        auth_token: String,
+        blind_token: BlindedClientToken,
+    ) -> Result<SingleBlindedSignature, AuthError> {
+        let (id, _) = valid_auth_token(auth_token)
+            .await
+            .map_err(|_| AuthError::RateLimited)?
+            .ok_or(AuthError::Forbidden)?;
+
+        consume_bw(id, 10).await.map_err(|e| {
+            tracing::warn!(err = debug(e), id, "failed to get bw token");
+            AuthError::RateLimited
+        })?;
+
+        let sig = BW_MIZARU_SK.blind_sign(&blind_token);
+        Ok(sig)
+    }
+
+    async fn get_connect_token(
+        &self,
+        auth_token: String,
+        level: AccountLevel,
+        epoch: u16,
+        blind_token: BlindedClientToken,
+    ) -> Result<BlindedSignature, AuthError> {
+        let (user_id, user_level) = match valid_auth_token(auth_token).await {
+            Ok(auth) => {
+                if let Some(level) = auth {
+                    level
+                } else {
+                    return Err(AuthError::Forbidden);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(err = debug(err), "database failed");
+                return Err(AuthError::RateLimited);
+            }
+        };
+        static LOGIN_COUNT_CACHE: LazyLock<Cache<String, Arc<AtomicU64>>> = LazyLock::new(|| {
+            Cache::builder()
+                .time_to_idle(Duration::from_secs(864000))
+                .build()
+        });
+        let counter = LOGIN_COUNT_CACHE
+            .get_with(
+                format!(
+                    "{user_id}-{}",
+                    (SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        / 86400)
+                ),
+                async { Default::default() },
+            )
+            .await;
+        let count = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(user_id, count, "authenticated auth token");
+        // exempt special testing account
+        if count > 20 && user_id != 9311416 {
+            tracing::warn!(user_id, count, "too many auths in the last day, rejecting");
+
+            return Err(AuthError::RateLimited);
+        }
+        let start = Instant::now();
+        // when the user is Plus now, but won't be Plus then, we should return WrongLevel *if the user is claiming to be Plus*.
+        if level == AccountLevel::Plus && (user_level != level) {
+            return Err(AuthError::WrongLevel);
+        }
+        let signed = match level {
+            AccountLevel::Free => &FREE_MIZARU_SK,
+            AccountLevel::Plus => &PLUS_MIZARU_SK,
+        }
+        .blind_sign(epoch, &blind_token);
+        tracing::debug!(elapsed = debug(start.elapsed()), "blind signing done");
+        Ok(signed)
+    }
+
+    /// This is a LEGACY endpoint!!
+    async fn get_exits(&self) -> Result<StdcodeSigned<ExitList>, GenericError> {
+        let ns = self.net_status_inner().await?;
+        let all_exits = ns
+            .exits
+            .into_values()
+            .filter(|(_, _, meta)| meta.category == ExitCategory::Core)
+            .map(|(vk, desc, _)| (vk, desc))
+            .collect();
+        let exit_list = ExitList {
+            all_exits,
+            city_names: serde_yaml::from_str(include_str!("city_names.yaml")).unwrap(),
+        };
+        Ok(StdcodeSigned::new(
+            exit_list,
+            DOMAIN_EXIT_DESCRIPTOR,
+            MASTER_SECRET.deref(),
+        ))
+    }
+
+    /// This is a LEGACY endpoint!!
+    async fn get_free_exits(&self) -> Result<StdcodeSigned<ExitList>, GenericError> {
+        let ns = self.net_status_inner().await?;
+        let all_exits = ns
+            .exits
+            .into_values()
+            .filter(|(_, _, meta)| {
+                meta.allowed_levels.contains(&AccountLevel::Free)
+                    && meta.category == ExitCategory::Core
+            })
+            .map(|(vk, desc, _)| (vk, desc))
+            .collect();
+        let exit_list = ExitList {
+            all_exits,
+            city_names: serde_yaml::from_str(include_str!("city_names.yaml")).unwrap(),
+        };
+        Ok(StdcodeSigned::new(
+            exit_list,
+            DOMAIN_EXIT_DESCRIPTOR,
+            MASTER_SECRET.deref(),
+        ))
+    }
+
+    async fn get_user_info(&self, auth_token: String) -> Result<Option<UserInfo>, AuthError> {
+        match valid_auth_token(auth_token).await {
+            Ok(Some((user_id, _))) => get_user_info(user_id).await,
+            Ok(None) => Ok(None),
+            Err(_) => Err(AuthError::RateLimited),
+        }
+    }
+
+    async fn get_user_info_by_cred(&self, cred: Credential) -> Result<Option<UserInfo>, AuthError> {
+        let user_id = validate_credential(cred).await;
+        if let Err(AuthError::Forbidden) = user_id {
+            return Ok(None);
+        }
+        get_user_info(user_id?).await
+    }
+
+    async fn get_exit_route(
+        &self,
+        args: GetExitRouteArgs,
+    ) -> Result<JsonSigned<ExitRouteDescriptor>, GenericError> {
+        let account_level = authenticate_account_level(args.token, &args.sig)?;
+        let net_status = self.net_status_inner().await?;
+        let rendezvous_key = blake3::hash(format!("{:?}", args.token).as_bytes());
+        let (exit_pubkey, exit) = select_exit_with_constraint(
+            rendezvous_key,
+            &args.exit_constraint,
+            account_level,
+            &net_status,
+        )?;
+        let route =
+            build_route_for_exit(args.token, account_level, &exit, &args.client_metadata).await?;
+        Ok(JsonSigned::new(
+            ExitRouteDescriptor {
+                exit_pubkey,
+                exit,
+                route,
+            },
+            DOMAIN_EXIT_ROUTE,
+            MASTER_SECRET.deref(),
+        ))
+    }
+
+    async fn get_routes_v2(&self, args: GetRoutesArgs) -> Result<RouteDescriptor, GenericError> {
+        let account_level = authenticate_account_level(args.token, &args.sig)?;
+        let exit = find_exit_by_b2e(args.exit_b2e).await?;
+        build_route_for_exit(args.token, account_level, &exit, &args.client_metadata).await
+    }
+
+    async fn get_routes(
+        &self,
+        token: ClientToken,
+        sig: UnblindedSignature,
+        exit_b2e: SocketAddr,
+    ) -> Result<RouteDescriptor, GenericError> {
+        self.get_routes_v2(GetRoutesArgs {
+            token,
+            sig,
+            exit_b2e,
+            client_metadata: Default::default(),
+        })
+        .await
+    }
+
+    async fn consume_bw_token(
+        &self,
+        token: ClientToken,
+        sig: SingleUnblindedSignature,
+    ) -> Result<(), AuthError> {
+        BW_MIZARU_SK
+            .to_public_key()
+            .blind_verify(token, &sig)
+            .map_err(|_| AuthError::Forbidden)?;
+        // Reject replays: the token is recorded as spent in postgres. A
+        // second submission of the same (token, sig) pair hits the primary
+        // key constraint and is refused.
+        match crate::database::bandwidth::record_spent_bw_token(token).await {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                tracing::warn!("replayed bw token rejected");
+                Err(AuthError::Forbidden)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to record spent bw token");
+                Err(AuthError::Forbidden)
+            }
+        }
+    }
+
+    async fn insert_exit(
+        &self,
+        descriptor: Mac<StdcodeSigned<ExitDescriptor>>,
+    ) -> Result<(), GenericError> {
+        let descriptor =
+            descriptor.verify(blake3::hash(CONFIG_FILE.wait().exit_token.as_bytes()).as_bytes())?;
+        let pubkey = descriptor.pubkey;
+        let descriptor = descriptor.verify(DOMAIN_EXIT_DESCRIPTOR, |_| true)?;
+
+        // Validate that the timestamp is reasonably current
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        if descriptor.expiry < now {
+            return Err(GenericError(
+                "Exit info timestamp is before current time (potential replay attack)".to_string(),
+            ));
+        }
+
+        sanity_check_exit(&descriptor).await?;
+
+        let exit = ExitRow {
+            pubkey: pubkey.to_bytes(),
+            c2e_listen: descriptor.c2e_listen.to_string(),
+            b2e_listen: descriptor.b2e_listen.to_string(),
+            country: descriptor.country.alpha2().into(),
+            city: descriptor.city.clone(),
+            load: descriptor.load,
+            expiry: (now + 60) as _,
+        };
+        insert_exit(&exit).await?;
+        Ok(())
+    }
+
+    async fn insert_exit_v2(
+        &self,
+        descriptor: Mac<JsonSigned<(ExitDescriptor, ExitMetadata)>>,
+    ) -> Result<(), GenericError> {
+        let descriptor =
+            descriptor.verify(blake3::hash(CONFIG_FILE.wait().exit_token.as_bytes()).as_bytes())?;
+        let pubkey = descriptor.pubkey();
+        let (descriptor, metadata) = descriptor.verify(DOMAIN_EXIT_DESCRIPTOR, |_| true)?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        if descriptor.expiry < now {
+            return Err(GenericError(
+                "Exit info timestamp is before current time (potential replay attack)".to_string(),
+            ));
+        }
+
+        sanity_check_exit(&descriptor).await?;
+
+        let exit = ExitRow {
+            pubkey: pubkey.to_bytes(),
+            c2e_listen: descriptor.c2e_listen.to_string(),
+            b2e_listen: descriptor.b2e_listen.to_string(),
+            country: descriptor.country.alpha2().into(),
+            city: descriptor.city.clone(),
+            load: descriptor.load,
+            expiry: (now + 60) as _,
+        };
+        insert_exit(&exit).await?;
+        insert_exit_metadata(pubkey.to_bytes(), metadata).await?;
+        Ok(())
+    }
+
+    async fn get_net_status(&self) -> Result<JsonSigned<NetStatus>, GenericError> {
+        let ns = self.net_status_inner().await?;
+        Ok(JsonSigned::new(
+            ns,
+            DOMAIN_NET_STATUS,
+            MASTER_SECRET.deref(),
+        ))
+    }
+
+    async fn insert_bridge(&self, descriptor: Mac<BridgeDescriptor>) -> Result<(), GenericError> {
+        let descriptor = descriptor
+            .verify(blake3::hash(CONFIG_FILE.wait().bridge_token.as_bytes()).as_bytes())?;
+        tracing::debug!("inserting bridge from pool {}", descriptor.pool);
+        crate::database::bridges::insert_bridge(&descriptor).await?;
+        Ok(())
+    }
+
+    async fn report_stats(&self, stats: Mac<Vec<StatEvent>>) -> Result<(), GenericError> {
+        let config = CONFIG_FILE.wait();
+        let bridge_key = blake3::hash(config.bridge_token.as_bytes());
+        let exit_key = blake3::hash(config.exit_token.as_bytes());
+        let events = stats
+            .clone()
+            .verify(bridge_key.as_bytes())
+            .or_else(|_| stats.verify(exit_key.as_bytes()))
+            .map_err(|_| GenericError("invalid stats MAC".to_string()))?;
+        if events.len() > 10_000 {
+            return Err(GenericError("too many stats in one batch".to_string()));
+        }
+        if let Some(sink) = STATS_SINK.as_ref() {
+            sink.send_many(&events);
+        }
+        Ok(())
+    }
+
+    async fn upload_available(&self, data: AvailabilityData) {
+        geph5_rt::spawn(
+            async move {
+                let current_timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                crate::database::bridges::record_availability(data).await
+            }
+            .inspect_err(|e| tracing::warn!(err = debug(e), "setting availability failed")),
+        )
+        .detach();
+    }
+
+    async fn get_puzzle(&self) -> (String, u16) {
+        (new_puzzle().await, CONFIG_FILE.wait().puzzle_difficulty)
+    }
+
+    async fn register_user_secret(
+        &self,
+        puzzle: String,
+        solution: String,
+    ) -> Result<String, GenericError> {
+        verify_puzzle_solution(&puzzle, &solution).await?;
+        Ok(register_secret().await?)
+    }
+
+    async fn upgrade_to_secret(&self, cred: Credential) -> Result<String, AuthError> {
+        // Legacy conversion is disabled: a stored hash cannot recover the
+        // previously issued secret. Secret callers already possess that value.
+        match cred {
+            Credential::Secret(secret) => {
+                validate_secret(&secret).await?;
+                Ok(secret)
+            }
+            _ => Err(AuthError::Forbidden),
+        }
+    }
+
+    async fn delete_account(&self, secret: String) -> Result<(), GenericError> {
+        // Temporary kill switch; re-enable once account deletion can resume.
+        const ACCOUNT_DELETION_ENABLED: bool = false;
+        if !ACCOUNT_DELETION_ENABLED {
+            return Err(GenericError(
+                "Account deletion is temporarily disabled".to_string(),
+            ));
+        }
+
+        // validate secret; get user_id
+        let user_id = validate_secret(&secret).await?;
+        // cancel stripe
+        let rpc = PaymentClient(PaymentTransport);
+        let sessid = payment_sessid(user_id).await?;
+        rpc.cancel_recurring(sessid).await?.map_err(GenericError)?;
+        // delete for good
+        auth::delete_user_by_secret(&secret).await?;
+        Ok(())
+    }
+
+    async fn get_news(&self, lang: String) -> Result<Vec<LegacyNewsItem>, GenericError> {
+        let (send, recv) = oneshot::channel();
+        geph5_rt::spawn(async move { send.send(fetch_news(&lang).await) }).detach();
+        recv.await.unwrap().map_err(|e: anyhow::Error| e.into())
+    }
+
+    async fn raw_price_points(&self) -> Result<Vec<(u32, u32)>, GenericError> {
+        Ok(vec![
+            // (7, 150),
+            (30, 500),
+            (90, 1500),
+            (365, 5475),
+            (730, 10342),
+        ])
+    }
+
+    async fn basic_price_points(&self) -> Result<Vec<(u32, u32)>, GenericError> {
+        Ok(vec![(30, 110), (90, 330), (365, 1205)])
+    }
+
+    async fn basic_mb_limit(&self) -> u32 {
+        5000
+    }
+
+    async fn payment_methods(&self) -> Result<Vec<String>, GenericError> {
+        Ok(vec![
+            "credit-card".into(),
+            "wechat".to_string(),
+            "alipay".to_string(),
+        ])
+    }
+
+    async fn create_payment(
+        &self,
+        secret: String,
+        days: u32,
+        method: String,
+    ) -> Result<String, GenericError> {
+        self.create_payment_inner(secret, days, method, crate::payments::Item::Plus)
+            .await
+    }
+
+    async fn create_basic_payment(
+        &self,
+        secret: String,
+        days: u32,
+        method: String,
+    ) -> Result<String, GenericError> {
+        self.create_payment_inner(secret, days, method, crate::payments::Item::Basic)
+            .await
+    }
+
+    async fn get_free_voucher(&self, secret: String) -> Result<Option<VoucherInfo>, GenericError> {
+        // TODO a db-driven implementation
+        let user_id = validate_secret(&secret).await?;
+        // if user_id == 42 {
+        let info = get_free_voucher(user_id).await?;
+        Ok(info)
+        // } else {
+        //     Ok(None)
+        // }
+    }
+
+    async fn call_geph_payments(
+        &self,
+        jrpc_req: JrpcRequest,
+    ) -> Result<JrpcResponse, GenericError> {
+        let rpc = PaymentTransport;
+        rpc.call_raw(jrpc_req)
+            .await
+            .map_err(|e| GenericError(e.to_string()))
+    }
+
+    async fn redeem_voucher(&self, secret: String, code: String) -> Result<i32, GenericError> {
+        // Validate the secret and get the user ID
+        let user_id = validate_secret(&secret).await?;
+
+        // Get a payment session for the user
+        let sessid = payment_sessid(user_id).await?;
+
+        // Special internal vouchers: just consume the local record and return
+        if code.contains("!") {
+            delete_free_voucher(user_id, code).await?;
+            return Ok(0);
+        }
+
+        // Call the payment service first; only delete the local record once it confirms success.
+        // This way a transient payment failure cannot silently destroy the voucher.
+        let days = PaymentClient(PaymentTransport)
+            .spend_giftcard(
+                sessid,
+                GiftcardWireInfo {
+                    gc_id: code.clone(),
+                    promo: "".to_string(),
+                },
+            )
+            .await?
+            .map_err(|e| GenericError(format!("Failed to redeem voucher: {}", e)))?;
+
+        delete_free_voucher(user_id, code).await?;
+
+        Ok(days)
+    }
+
+    async fn upload_debug_pack(
+        &self,
+        email: Option<String>,
+        logs: String,
+    ) -> Result<(), GenericError> {
+        // Dummy implementation - in real implementation, this would store the logs and email
+        tracing::info!(
+            email = debug(email),
+            logs_len = logs.len(),
+            "Debug pack uploaded"
+        );
+
+        // In a real implementation we would:
+        // 1. Store the logs in a database or file system
+        // 2. If email is provided, notify support personnel
+        // 3. Generate a reference ID for the debug pack
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ed25519_dalek::SigningKey;
+    use isocountry::CountryCode;
+    use serde_json::json;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn legacy_conversion_is_disabled_without_database_access() {
+        let result = BrokerImpl {}
+            .upgrade_to_secret(Credential::LegacyUsernamePassword {
+                username: "legacy".into(),
+                password: "password".into(),
+            })
+            .await;
+        assert!(matches!(result, Err(AuthError::Forbidden)));
+    }
+
+    #[test]
+    fn parse_client_ip_accepts_ipv4() {
+        let metadata = json!({"ip_addr": "1.2.3.4"});
+        assert_eq!(parse_client_ip(&metadata), Some("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn parse_client_ip_accepts_ipv6() {
+        let metadata = json!({"ip_addr": "2001:db8::1"});
+        assert_eq!(
+            parse_client_ip(&metadata),
+            Some("2001:db8::1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_client_ip_rejects_invalid() {
+        let metadata = json!({"ip_addr": "not-an-ip"});
+        assert_eq!(parse_client_ip(&metadata), None);
+    }
+
+    fn tcp_route(port: u16) -> RouteDescriptor {
+        RouteDescriptor::Tcp(format!("127.0.0.1:{port}").parse().unwrap())
+    }
+
+    fn route_port(route: &RouteDescriptor) -> u16 {
+        match route {
+            RouteDescriptor::Tcp(addr) => addr.port(),
+            other => panic!("expected tcp route, got {other:?}"),
+        }
+    }
+
+    fn race_ports(route: &RouteDescriptor) -> Vec<u16> {
+        match route {
+            RouteDescriptor::Race(routes) => routes.iter().map(route_port).collect(),
+            other => panic!("expected race route, got {other:?}"),
+        }
+    }
+
+    fn fallback_pair(route: &RouteDescriptor) -> (&RouteDescriptor, &RouteDescriptor) {
+        match route {
+            RouteDescriptor::Fallback(routes) => {
+                assert_eq!(routes.len(), 2);
+                let ipv6 = match &routes[0] {
+                    RouteDescriptor::Timeout {
+                        milliseconds,
+                        lower,
+                    } => {
+                        assert_eq!(*milliseconds, IPV6_FALLBACK_TIMEOUT_MS);
+                        lower.as_ref()
+                    }
+                    other => panic!("expected timeout-wrapped IPv6 route, got {other:?}"),
+                };
+                (ipv6, &routes[1])
+            }
+            other => panic!("expected fallback route, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipv6_pool_is_grouped_behind_ipv4_fallback() {
+        let routes = group_ipv6_fallback_routes(vec![
+            ("alpha".into(), tcp_route(9001)),
+            ("alpha_ipv6".into(), tcp_route(9002)),
+        ]);
+
+        assert_eq!(routes.len(), 1);
+        let (ipv6, ipv4) = fallback_pair(&routes[0]);
+        assert_eq!(route_port(ipv6), 9002);
+        assert_eq!(route_port(ipv4), 9001);
+    }
+
+    #[test]
+    fn multiple_family_routes_are_raced_inside_fallback() {
+        let routes = group_ipv6_fallback_routes(vec![
+            ("alpha".into(), tcp_route(9001)),
+            ("alpha_ipv6".into(), tcp_route(9002)),
+            ("alpha".into(), tcp_route(9003)),
+            ("alpha_ipv6".into(), tcp_route(9004)),
+        ]);
+
+        assert_eq!(routes.len(), 1);
+        let (ipv6, ipv4) = fallback_pair(&routes[0]);
+        assert_eq!(race_ports(ipv6), vec![9002, 9004]);
+        assert_eq!(race_ports(ipv4), vec![9001, 9003]);
+    }
+
+    #[test]
+    fn unpaired_ipv4_and_ipv6_pools_remain_direct_routes() {
+        let routes = group_ipv6_fallback_routes(vec![
+            ("alpha".into(), tcp_route(9001)),
+            ("beta_ipv6".into(), tcp_route(9002)),
+        ]);
+
+        assert_eq!(routes.len(), 2);
+        assert_eq!(route_port(&routes[0]), 9001);
+        assert_eq!(route_port(&routes[1]), 9002);
+    }
+
+    #[test]
+    fn only_trailing_ipv6_suffix_is_special() {
+        let routes = group_ipv6_fallback_routes(vec![
+            ("alpha".into(), tcp_route(9001)),
+            ("alpha_ipv6_extra".into(), tcp_route(9002)),
+        ]);
+
+        assert_eq!(routes.len(), 2);
+        assert_eq!(route_port(&routes[0]), 9001);
+        assert_eq!(route_port(&routes[1]), 9002);
+    }
+
+    #[test]
+    fn unrelated_pool_names_are_not_grouped() {
+        let routes = group_ipv6_fallback_routes(vec![
+            ("alpha_ipv6".into(), tcp_route(9001)),
+            ("alphabet".into(), tcp_route(9002)),
+        ]);
+
+        assert_eq!(routes.len(), 2);
+        assert_eq!(route_port(&routes[0]), 9001);
+        assert_eq!(route_port(&routes[1]), 9002);
+    }
+
+    fn sample_net_status() -> NetStatus {
+        let exits = [
+            (
+                "a".to_string(),
+                (
+                    SigningKey::from_bytes(&[1; 32]).verifying_key(),
+                    ExitDescriptor {
+                        c2e_listen: "10.0.0.1:443".parse().unwrap(),
+                        b2e_listen: "10.0.0.1:8443".parse().unwrap(),
+                        country: CountryCode::CAN,
+                        city: "Toronto".into(),
+                        load: 0.2,
+                        expiry: 1,
+                    },
+                    ExitMetadata {
+                        allowed_levels: vec![AccountLevel::Free, AccountLevel::Plus],
+                        category: ExitCategory::Core,
+                    },
+                ),
+            ),
+            (
+                "b".to_string(),
+                (
+                    SigningKey::from_bytes(&[2; 32]).verifying_key(),
+                    ExitDescriptor {
+                        c2e_listen: "10.0.0.2:443".parse().unwrap(),
+                        b2e_listen: "10.0.0.2:8443".parse().unwrap(),
+                        country: CountryCode::CAN,
+                        city: "Toronto".into(),
+                        load: 0.4,
+                        expiry: 1,
+                    },
+                    ExitMetadata {
+                        allowed_levels: vec![AccountLevel::Free, AccountLevel::Plus],
+                        category: ExitCategory::Streaming,
+                    },
+                ),
+            ),
+            (
+                "c".to_string(),
+                (
+                    SigningKey::from_bytes(&[3; 32]).verifying_key(),
+                    ExitDescriptor {
+                        c2e_listen: "10.0.0.3:443".parse().unwrap(),
+                        b2e_listen: "10.0.0.3:8443".parse().unwrap(),
+                        country: CountryCode::NLD,
+                        city: "Amsterdam".into(),
+                        load: 0.1,
+                        expiry: 1,
+                    },
+                    ExitMetadata {
+                        allowed_levels: vec![AccountLevel::Plus],
+                        category: ExitCategory::Core,
+                    },
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        NetStatus { exits }
+    }
+
+    #[test]
+    fn auto_constraint_only_picks_core_exits() {
+        let net_status = sample_net_status();
+        let (_, exit) = select_exit_with_constraint(
+            blake3::hash(b"seed"),
+            &ExitConstraint::Auto,
+            AccountLevel::Free,
+            &net_status,
+        )
+        .unwrap();
+        assert_eq!(exit.b2e_listen, "10.0.0.1:8443".parse().unwrap());
+    }
+
+    #[test]
+    fn hostname_constraint_matches_ip_string() {
+        let net_status = sample_net_status();
+        let (_, exit) = select_exit_with_constraint(
+            blake3::hash(b"seed"),
+            &ExitConstraint::Hostname("10.0.0.3".into()),
+            AccountLevel::Plus,
+            &net_status,
+        )
+        .unwrap();
+        assert_eq!(exit.city, "Amsterdam");
+    }
+
+    #[test]
+    fn direct_constraint_is_rejected() {
+        let net_status = sample_net_status();
+        assert!(
+            select_exit_with_constraint(
+                blake3::hash(b"seed"),
+                &ExitConstraint::Direct("10.0.0.3:443/abc".into()),
+                AccountLevel::Plus,
+                &net_status,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn token_seed_is_deterministic() {
+        let net_status = sample_net_status();
+        let first = select_exit_with_constraint(
+            blake3::hash(b"token-a"),
+            &ExitConstraint::Country(CountryCode::CAN),
+            AccountLevel::Free,
+            &net_status,
+        )
+        .unwrap()
+        .1;
+        let second = select_exit_with_constraint(
+            blake3::hash(b"token-a"),
+            &ExitConstraint::Country(CountryCode::CAN),
+            AccountLevel::Free,
+            &net_status,
+        )
+        .unwrap()
+        .1;
+        assert_eq!(first.b2e_listen, second.b2e_listen);
+    }
+}
+
+/// Fire-and-forget sink towards the local Telegraf statsd listener.
+pub static STATS_SINK: Lazy<Option<StatsdUdpSink>> = Lazy::new(|| {
+    CONFIG_FILE
+        .wait()
+        .statsd_addr
+        .map(|addr| StatsdUdpSink::new(addr).unwrap())
+});

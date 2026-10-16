@@ -1,0 +1,233 @@
+use std::{
+    num::NonZeroU32,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use atomic_float::AtomicF32;
+use geph5_broker_protocol::AccountLevel;
+use geph5_rt::{TimeoutExt, pooled_read};
+use governor::{DefaultDirectRateLimiter, Quota};
+use mizaru2::ClientToken;
+use once_cell::sync::Lazy;
+use sysinfo::System;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+
+use crate::{
+    CONFIG_FILE,
+    bw_accounting::BwAccount,
+    session::{RATE_LIMITER_CACHE, SessionKey},
+};
+
+static CPU_USAGE: Lazy<AtomicF32> = Lazy::new(|| AtomicF32::new(0.0));
+static CURRENT_SPEED: Lazy<AtomicF32> = Lazy::new(|| AtomicF32::new(0.0));
+static MEM_USAGE: Lazy<AtomicF32> = Lazy::new(|| AtomicF32::new(0.0));
+
+pub fn get_load() -> f32 {
+    // we weigh CPU usage lower until it's really close to massively overloading
+    let cpu = CPU_USAGE.load(Ordering::Relaxed).powi(2);
+    let speed = CURRENT_SPEED.load(Ordering::Relaxed)
+        / (CONFIG_FILE.wait().total_ratelimit as f32 * 1000.0);
+    // memory only dominates when genuinely close to OOM; reclaimable cache and free swap count as available
+    let mem = MEM_USAGE.load(Ordering::Relaxed).powi(6);
+    cpu.max(speed).max(mem)
+}
+
+pub fn get_kbps() -> f32 {
+    CURRENT_SPEED.load(Ordering::Relaxed) / 1000.0
+}
+
+pub static TOTAL_BYTE_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub fn update_load_loop() {
+    let mut sys = System::new_all();
+    let mut cpu_accum = 0.0;
+    let mut last_count_time = Instant::now();
+    let mut last_byte_count = 0;
+    let mut last_speed = 0.0;
+    loop {
+        for _ in 0..100 {
+            sys.refresh_all();
+            let cpu_usage: f32 = sys.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>()
+                / sys.cpus().len() as f32
+                / 100.0;
+            cpu_accum = cpu_accum * 0.99 + cpu_usage * 0.01;
+
+            CPU_USAGE.store(cpu_accum, Ordering::Relaxed);
+
+            let total_mem = sys.total_memory() + sys.total_swap();
+            if total_mem > 0 {
+                let available_mem = sys.available_memory() + sys.free_swap();
+                let mem_usage = 1.0 - (available_mem as f32 / total_mem as f32);
+                MEM_USAGE.store(mem_usage, Ordering::Relaxed);
+            }
+
+            let new_byte_count = TOTAL_BYTE_COUNT.load(Ordering::Relaxed);
+            let byte_diff = new_byte_count - last_byte_count;
+            let byte_rate = byte_diff as f32 / last_count_time.elapsed().as_secs_f32();
+            last_speed = last_speed * 0.99 + byte_rate * 0.01; // Exponential decay for current speed
+            CURRENT_SPEED.store(last_speed, Ordering::Relaxed);
+
+            last_count_time = Instant::now();
+            last_byte_count = new_byte_count;
+
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        tracing::info!(load = get_load(), "updated load");
+    }
+}
+
+pub async fn get_ratelimiter(
+    level: AccountLevel,
+    token: ClientToken,
+    session_key: SessionKey,
+) -> RateLimiter {
+    RATE_LIMITER_CACHE
+        .get_with(session_key, async move {
+            match level {
+                AccountLevel::Free => {
+                    RateLimiter::new(CONFIG_FILE.wait().free_ratelimit, BwAccount::empty(), None)
+                }
+                AccountLevel::Plus => RateLimiter::new(
+                    CONFIG_FILE.wait().plus_ratelimit,
+                    BwAccount::empty(),
+                    Some(token.to_string()),
+                )
+                .with_fallback(CONFIG_FILE.wait().free_ratelimit / 2),
+            }
+        })
+        .await
+}
+
+/// A generic rate limiter.
+#[derive(Clone)]
+pub struct RateLimiter {
+    inner: Option<Arc<DefaultDirectRateLimiter>>,
+    fallback: Option<Arc<DefaultDirectRateLimiter>>,
+    log_tag: Option<String>,
+    bw_account: BwAccount,
+    bw_enabled: Arc<AtomicBool>,
+}
+
+impl RateLimiter {
+    /// Creates a new rate limiter with the given speed limit, in KiB/s.
+    pub fn new(limit_kb: u32, bw_account: BwAccount, log_tag: Option<String>) -> Self {
+        let limit = NonZeroU32::new((limit_kb + 1) * 1024).unwrap();
+        let burst_size = burst_size(limit_kb);
+        let inner = governor::RateLimiter::direct(Quota::per_second(limit).allow_burst(burst_size));
+        Self {
+            inner: Some(Arc::new(inner)),
+            fallback: None,
+            log_tag,
+            bw_account,
+            bw_enabled: Default::default(),
+        }
+    }
+
+    /// Configure a fallback rate limit, used when paid bandwidth is exhausted.
+    pub fn with_fallback(mut self, limit_kb: u32) -> Self {
+        let limit = NonZeroU32::new((limit_kb + 1) * 1024).unwrap();
+        let burst = burst_size(limit_kb);
+        let fb = governor::RateLimiter::direct(Quota::per_second(limit).allow_burst(burst));
+        self.fallback = Some(Arc::new(fb));
+        self
+    }
+
+    /// Enable bandwidth accounting.
+    pub fn enable_bw(&self) {
+        self.bw_enabled.store(true, Ordering::SeqCst);
+    }
+
+    /// Gets the BwAccount out of this ratelimit
+    pub fn bw_account(&self) -> BwAccount {
+        self.bw_account.clone()
+    }
+
+    /// Creates a new unlimited ratelimit.
+    pub fn unlimited(bw_account: BwAccount, log_tag: Option<String>) -> Self {
+        Self {
+            inner: None,
+            fallback: None,
+            bw_account,
+            log_tag,
+            bw_enabled: Default::default(),
+        }
+    }
+
+    /// Waits until the given number of bytes can be let through.
+    pub async fn wait(&self, bytes: usize) {
+        TOTAL_BYTE_COUNT.fetch_add(bytes as _, Ordering::Relaxed);
+        if bytes == 0 {
+            return;
+        }
+        let charged_bytes = bytes;
+        let multiplier = (1.0 / (1.0 - get_load().min(0.999)) - 1.0) / 2.0;
+
+        let rate_limited_bytes = (bytes as f32 * (multiplier.max(1.0))).min(100000.0);
+
+        if let Some(inner) = &self.inner {
+            let out_of_bw = self.bw_enabled.load(Ordering::SeqCst)
+                && self.bw_account.consume_bw(charged_bytes) == 0;
+            let limiter = if out_of_bw {
+                self.fallback.as_ref().unwrap_or(inner)
+            } else {
+                inner
+            };
+
+            let mut delay: f32 = 0.005;
+            loop {
+                if limiter
+                    .check_n((rate_limited_bytes as u32).try_into().unwrap())
+                    .unwrap()
+                    .is_ok()
+                {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_secs_f32(delay)).await;
+                delay += rand::random::<f32>() * 0.05;
+            }
+        }
+    }
+
+    /// Copy one stream to another, rate-limited by this rate limit.
+    pub async fn io_copy(
+        &self,
+        mut read_stream: impl AsyncRead + Unpin,
+        mut write_stream: impl AsyncWrite + Unpin,
+    ) -> std::io::Result<u64> {
+        let mut total_bytes = 0;
+
+        loop {
+            let bts = pooled_read(&mut read_stream, 8192)
+                .timeout(Duration::from_secs(1800))
+                .await
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout in TCP read")
+                })??;
+            match bts {
+                None => break,
+                Some(bts) => {
+                    self.wait(bts.len()).await;
+
+                    write_stream.write_all(&bts).await?;
+                    total_bytes += bts.len() as u64;
+                }
+            }
+        }
+
+        Ok(total_bytes)
+    }
+}
+
+fn burst_size(limit_kb: u32) -> NonZeroU32 {
+    NonZeroU32::new(
+        200_u32
+            .max((limit_kb + 1).saturating_mul(5))
+            .saturating_mul(1024),
+    )
+    .unwrap()
+}

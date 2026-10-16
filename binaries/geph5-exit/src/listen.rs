@@ -1,0 +1,265 @@
+use anyhow::Context;
+use ed25519_dalek::Signer;
+use futures_concurrency::future::Race;
+use futures_util::TryFutureExt;
+use geph5_broker_protocol::AccountLevel;
+use geph5_ip_to_asn::ip_to_asn_country;
+use geph5_misc_rpc::{
+    bridge::{B2eMetadata, ObfsProtocol},
+    exit::{ClientCryptHello, ClientExitCryptPipe, ClientHello, ExitHello, ExitHelloInner},
+    read_prepend_length, write_prepend_length,
+};
+use mizaru2::{ClientToken, UnblindedSignature};
+use moka::future::Cache;
+use picomux::{LivenessConfig, PicoMux};
+
+use sillad::{EitherPipe, Pipe, listener::Listener, tcp::TcpListener};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+use stdcode::StdcodeSerializeExt;
+use tachyonix::Sender;
+
+use x25519_dalek::{EphemeralSecret, PublicKey};
+mod b2e_process;
+mod tls;
+
+use crate::{
+    CONFIG_FILE, SIGNING_SECRET,
+    auth::verify_user,
+    broker::{ACCEPT_FREE, broker_loop},
+    bw_accounting::{BwAccount, bw_accounting_loop},
+    ipv6::{EyeballDialer, configure_ipv6_routing, eyeball_addr_for_session},
+    proxy::proxy_stream,
+    ratelimit::{RateLimiter, get_ratelimiter},
+    session::SessionKey,
+    tasklimit::new_task_until_death,
+};
+
+pub async fn listen_main() -> anyhow::Result<()> {
+    configure_ipv6_routing().await?;
+    let c2e = c2e_loop();
+    let b2e = b2e_loop();
+    let broker = broker_loop();
+    let google_selfcheck = crate::google_selfcheck::google_selfcheck_loop();
+    (c2e, broker, b2e, google_selfcheck).race().await
+}
+
+async fn c2e_loop() -> anyhow::Result<()> {
+    let listener = TcpListener::bind(CONFIG_FILE.wait().c2e_listen).await?;
+    let mut listener = sillad_conntest::ConnTestListener::new(listener);
+    loop {
+        let c2e_raw = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::error!(err = debug(err), "error accepting");
+                continue;
+            }
+        };
+
+        let test_addr = async {
+            let remote_addr: SocketAddr = c2e_raw.remote_addr().unwrap().parse()?;
+            let (asn, country) = ip_to_asn_country(remote_addr.ip()).await?;
+            tracing::trace!(asn, country, remote_addr = display(remote_addr), "got ASN");
+            if CONFIG_FILE.wait().country_blacklist.contains(&country) {
+                anyhow::bail!(
+                    "rejected connection from {remote_addr}/AS{asn} in blacklisted country {country}"
+                )
+            }
+            anyhow::Ok((asn, country))
+        };
+        let (asn, country) = match test_addr.await {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(err = debug(err), "rejected a direct connection");
+                continue;
+            }
+        };
+        geph5_rt::spawn(handle_client(crate::direct_count::DirectCountPipe::new(
+            c2e_raw, asn, country,
+        )))
+        .detach()
+    }
+}
+
+async fn b2e_loop() -> anyhow::Result<()> {
+    let mut listener = TcpListener::bind(CONFIG_FILE.wait().b2e_listen).await?;
+    let b2e_table: Cache<ObfsProtocol, Sender<picomux::Stream>> = Cache::builder()
+        .time_to_idle(Duration::from_secs(1200))
+        .build();
+    let b2e_table_report = b2e_table.clone();
+    geph5_rt::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            tracing::info!(
+                b2e_table_entries = b2e_table_report.entry_count(),
+                "b2e table snapshot"
+            );
+        }
+    })
+    .detach();
+    loop {
+        let b2e_raw = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::error!(err = debug(err), "error accepting");
+                continue;
+            }
+        };
+        let bridge_addr = b2e_raw
+            .remote_addr()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let (read, write) = tokio::io::split(b2e_raw);
+        let mut b2e_mux = PicoMux::new(read, write);
+        b2e_mux.set_liveness(LivenessConfig {
+            ping_interval: Duration::from_secs(3600),
+            timeout: Duration::from_secs(3600),
+        });
+        let b2e_table = b2e_table.clone();
+        geph5_rt::spawn(async move {
+            loop {
+                let lala = b2e_mux.accept().await?;
+                let b2e_metadata: B2eMetadata = stdcode::deserialize(lala.metadata())?;
+                let protocol = b2e_metadata.protocol;
+                tracing::trace!(
+                    bridge_addr = display(&bridge_addr),
+                    "accepting b2e with metadata"
+                );
+
+                let send = b2e_table
+                    .get_with(protocol.clone(), async {
+                        tracing::debug!(
+                            bridge_addr = display(&bridge_addr),
+                            table_length = display(b2e_table.entry_count()),
+                            "creating new b2e metadata"
+                        );
+                        let (send, recv) = tachyonix::channel(1);
+                        geph5_rt::spawn(b2e_process::b2e_process(protocol, recv)).detach();
+                        send
+                    })
+                    .await;
+                send.send(lala).await.ok().context("could not accept")?;
+            }
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        })
+        .detach()
+    }
+}
+
+async fn handle_client(mut client: impl Pipe) -> anyhow::Result<()> {
+    // execute the authentication
+    let client_hello: ClientHello = stdcode::deserialize(&read_prepend_length(&mut client).await?)?;
+
+    let keys: Option<([u8; 32], [u8; 32])>;
+    let exit_hello_inner: ExitHelloInner = match client_hello.crypt_hello {
+        ClientCryptHello::SharedSecretChallenge(key) => {
+            let real_ss = client.shared_secret().context("no shared secret")?;
+            let mac = blake3::keyed_hash(&key, real_ss);
+            keys = None;
+            ExitHelloInner::SharedSecretResponse(mac)
+        }
+        ClientCryptHello::X25519(their_epk) => {
+            let my_esk = EphemeralSecret::random_from_rng(rand_core::OsRng);
+            let my_epk = PublicKey::from(&my_esk);
+            let shared_secret = my_esk.diffie_hellman(&their_epk);
+            let read_key = blake3::derive_key("c2e", shared_secret.as_bytes());
+            let write_key = blake3::derive_key("e2c", shared_secret.as_bytes());
+            keys = Some((read_key, write_key));
+            ExitHelloInner::X25519(my_epk)
+        }
+    };
+
+    let mut is_free = false;
+    let mut session_key = SessionKey::new(&client_hello);
+
+    let ratelimit = if CONFIG_FILE.wait().broker.is_some() {
+        let (level, token, sig): (AccountLevel, ClientToken, UnblindedSignature) =
+            stdcode::deserialize(&client_hello.credentials)
+                .context("cannot deserialize credentials")?;
+        if level == AccountLevel::Free && !ACCEPT_FREE.load(std::sync::atomic::Ordering::Relaxed) {
+            anyhow::bail!("free users rejected here")
+        }
+        verify_user(level, token, sig).await.inspect_err(|e| {
+            tracing::warn!(err = debug(e), "**** BAD BAD bad token received ***")
+        })?;
+        is_free = level == AccountLevel::Free;
+        session_key = SessionKey::new(&(level, token));
+        get_ratelimiter(level, token, session_key).await
+    } else {
+        RateLimiter::unlimited(BwAccount::unlimited(), None)
+    };
+
+    let exit_hello = ExitHello {
+        inner: exit_hello_inner.clone(),
+        signature: SIGNING_SECRET.sign(&(client_hello, exit_hello_inner).stdcode()),
+    };
+    write_prepend_length(&exit_hello.stdcode(), &mut client).await?;
+
+    let client = if let Some((read_key, write_key)) = keys {
+        EitherPipe::Left(ClientExitCryptPipe::new(client, read_key, write_key))
+    } else {
+        EitherPipe::Right(client)
+    };
+
+    let (client_read, client_write) = tokio::io::split(client);
+    let mux = PicoMux::new(client_read, client_write);
+    mux.set_debloat(true);
+
+    let mut sess_metadata = None;
+    let eyeball_addr = eyeball_addr_for_session(session_key);
+    let dialer = EyeballDialer::new(eyeball_addr);
+    loop {
+        let stream = mux.accept().await?;
+        let metadata = String::from_utf8_lossy(stream.metadata()).to_string();
+
+        // special metadata forms
+
+        // The first JSON stream sets session metadata. Later JSON streams can be rich tunnel
+        // commands and must be forwarded to proxy_stream.
+        if sess_metadata.is_none()
+            && let Ok(new_sess_metadata) = serde_json::from_str::<serde_json::Value>(&metadata)
+        {
+            sess_metadata = Some(Arc::new(new_sess_metadata));
+            continue;
+        }
+
+        // the legacy one is "dummy" and does not enforce, due to client  bugs
+        if metadata == "!bw-accounting" {
+            geph5_rt::spawn(
+                bw_accounting_loop(ratelimit.bw_account(), stream)
+                    .inspect_err(|e| tracing::warn!(err = debug(e), "bw_accounting_loop died")),
+            )
+            .detach();
+            continue;
+        }
+        if metadata == "!bw-accounting-2" {
+            ratelimit.enable_bw();
+            geph5_rt::spawn(
+                bw_accounting_loop(ratelimit.bw_account(), stream)
+                    .inspect_err(|e| tracing::warn!(err = debug(e), "bw_accounting_loop died")),
+            )
+            .detach();
+            continue;
+        }
+
+        let sess_metadata = sess_metadata
+            .clone()
+            .unwrap_or_else(|| Arc::new(serde_json::Value::Null));
+        let dialer = dialer.clone();
+        geph5_rt::spawn(
+            (
+                proxy_stream(
+                    dialer,
+                    sess_metadata.clone(),
+                    ratelimit.clone(),
+                    stream,
+                    is_free,
+                ),
+                new_task_until_death(Duration::from_secs(1)),
+            )
+                .race()
+                .map_err(|e| tracing::trace!(err = debug(e), "stream died with")),
+        )
+        .detach();
+    }
+}

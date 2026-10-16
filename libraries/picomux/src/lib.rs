@@ -1,0 +1,647 @@
+mod bdp;
+mod buffer_table;
+mod frame;
+mod outgoing;
+
+use std::{
+    convert::Infallible,
+    fmt::Debug,
+    io::ErrorKind,
+    ops::Deref,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    task::Poll,
+    time::{Duration, Instant},
+};
+
+use anyhow::Context;
+
+use std::future::Future;
+
+use bdp::BwEstimate;
+use buffer_table::BufferTable;
+use bytes::Bytes;
+use frame::{CMD_FIN, CMD_MORE, CMD_NOP, CMD_PING, CMD_PONG, CMD_PSH, CMD_SYN, Frame};
+use futures_concurrency::future::Race;
+use futures_util::{FutureExt, future::Shared};
+use geph5_rt::{Task, TaskReaper, TimeoutExt, pooled_read, spawn};
+use outgoing::Outgoing;
+use parking_lot::Mutex;
+use pin_project::pin_project;
+use rand::Rng;
+use tachyonix::{Receiver, Sender};
+use tap::Tap;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
+
+use crate::frame::{Header, PingInfo};
+
+const INIT_WINDOW: usize = 10;
+const MAX_WINDOW: usize = 1500;
+const MSS: usize = 8192;
+
+#[derive(Clone, Copy, Debug)]
+pub struct LivenessConfig {
+    pub ping_interval: Duration,
+    pub timeout: Duration,
+}
+
+impl Default for LivenessConfig {
+    fn default() -> Self {
+        Self {
+            ping_interval: Duration::from_secs(1800),
+            timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+pub struct PicoMux {
+    task: Shared<Task<Arc<std::io::Result<Infallible>>>>,
+    send_open_req: Sender<(Bytes, oneshot::Sender<Stream>)>,
+
+    recv_accepted: async_channel::Receiver<Stream>,
+    send_liveness: async_channel::Sender<LivenessConfig>,
+    liveness: LivenessConfig,
+
+    last_ping: Arc<Mutex<Option<Duration>>>,
+
+    debloat: Arc<AtomicBool>,
+}
+
+impl PicoMux {
+    /// Creates a new picomux wrapping the given underlying connection.
+    pub fn new(
+        read: impl AsyncRead + 'static + Send + Unpin,
+        write: impl AsyncWrite + Send + Unpin + 'static,
+    ) -> Self {
+        let (send_open_req, recv_open_req) = tachyonix::channel(1);
+        let (send_accepted, recv_accepted) = async_channel::bounded(100);
+        let (send_liveness, recv_liveness) = async_channel::unbounded();
+        let liveness = LivenessConfig::default();
+        send_liveness.try_send(liveness).unwrap();
+        let last_ping = Arc::new(Mutex::new(None));
+        let debloat: Arc<AtomicBool> = Arc::new(Default::default());
+        let task = spawn(
+            picomux_inner(
+                read,
+                write,
+                send_accepted,
+                recv_open_req,
+                recv_liveness,
+                last_ping.clone(),
+                debloat.clone(),
+            )
+            .map(Arc::new),
+        )
+        .shared();
+        Self {
+            task,
+            recv_accepted,
+            send_open_req,
+
+            send_liveness,
+            liveness,
+
+            last_ping,
+            debloat,
+        }
+    }
+
+    /// Returns whether the mux is alive.
+    pub fn is_alive(&self) -> bool {
+        self.task.peek().is_none()
+    }
+
+    /// Returns whether debloat mode is on. Turning on debloat mode activates a **receive-side** anti-bufferbloat algorithm.
+    pub fn is_debloat(&self) -> bool {
+        self.debloat.load(Ordering::SeqCst)
+    }
+
+    /// Turns debloat mode on or off. Turning on debloat mode activates a **receive-side** anti-bufferbloat algorithm.
+    pub fn set_debloat(&self, is_on: bool) {
+        self.debloat.store(is_on, Ordering::SeqCst)
+    }
+
+    /// Waits for the whole mux to die of some error.
+    pub async fn wait_until_dead(&self) -> anyhow::Result<()> {
+        self.wait_error().await?
+    }
+
+    /// Sets the liveness maintenance configuration for this session.
+    pub fn set_liveness(&mut self, liveness: LivenessConfig) {
+        self.liveness = liveness;
+        let _ = self.send_liveness.try_send(liveness);
+    }
+
+    /// Accepts a new stream from the peer.
+    pub async fn accept(&self) -> std::io::Result<Stream> {
+        let err = self.wait_error();
+        let recv = async {
+            if let Ok(val) = self.recv_accepted.recv().await {
+                Ok(val)
+            } else {
+                futures_util::future::pending().await
+            }
+        };
+        (recv, err).race().await
+    }
+
+    /// Reads the latency from the last successful ping.
+    pub fn last_latency(&self) -> Option<Duration> {
+        *self.last_ping.lock()
+    }
+
+    /// Opens a new stream to the peer, putting the given metadata in the stream.
+    pub async fn open(&self, metadata: &[u8]) -> std::io::Result<Stream> {
+        {
+            tracing::debug!("forcing a ping based on open");
+            let _ = self.send_liveness.try_send(self.liveness);
+        }
+        let (send, recv) = oneshot::channel();
+        let _ = self
+            .send_open_req
+            .send((Bytes::copy_from_slice(metadata), send))
+            .await;
+        let recv = async {
+            if let Ok(val) = recv.await {
+                Ok(val)
+            } else {
+                futures_util::future::pending().await
+            }
+        };
+        (recv, self.wait_error()).race().await
+    }
+
+    fn wait_error<T>(&self) -> impl Future<Output = std::io::Result<T>> + 'static {
+        let res = self.task.clone();
+        async move {
+            let res = res.await;
+            match res.deref() {
+                Err(err) => Err(std::io::Error::new(err.kind(), err.to_string())),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+static MUX_ID_CTR: AtomicU64 = AtomicU64::new(0);
+
+#[tracing::instrument(skip_all, fields(mux_id=MUX_ID_CTR.fetch_add(1, Ordering::Relaxed)))]
+async fn picomux_inner(
+    read: impl AsyncRead + 'static + Send + Unpin,
+    write: impl AsyncWrite + Send + Unpin + 'static,
+    send_accepted: async_channel::Sender<Stream>,
+    mut recv_open_req: Receiver<(Bytes, oneshot::Sender<Stream>)>,
+    recv_liveness: async_channel::Receiver<LivenessConfig>,
+    last_ping: Arc<Mutex<Option<Duration>>>,
+    debloat: Arc<AtomicBool>,
+) -> Result<Infallible, std::io::Error> {
+    let reaper = TaskReaper::new();
+    let mut inner_read = BufReader::with_capacity(MSS * 4, read);
+
+    let outgoing = Outgoing::new(write);
+    let (send_pong, recv_pong) = async_channel::unbounded();
+    let buffer_table = BufferTable::new();
+
+    let create_stream = |stream_id, metadata: Bytes| {
+        let mut buffer_recv = buffer_table.create_entry(stream_id);
+        let (mut write_incoming, read_incoming) = tokio::io::duplex(MSS * 2);
+        let (write_outgoing, mut read_outgoing) = tokio::io::duplex(MSS * 2);
+        let (shutdown_send, shutdown) = oneshot::channel();
+        let (closed_send, closed) = oneshot::channel();
+        let stream = Stream {
+            shutdown,
+            shutdown_complete: false,
+            _closed: closed_send,
+            write_outgoing,
+            read_incoming,
+            metadata,
+            on_write: Box::new(|_| {}),
+            on_read: Box::new(|_| {}),
+        };
+
+        let receive_task = {
+            let outgoing = outgoing.clone();
+            let debloat = debloat.clone();
+            async move {
+                let receive = async {
+                    let mut remote_window = INIT_WINDOW;
+                    let mut target_remote_window = MAX_WINDOW;
+
+                    let mut bw_estimate = BwEstimate::new(1_000_000.0);
+                    loop {
+                        let min_quantum = (target_remote_window / 10).clamp(1, 500);
+                        let frame = buffer_recv.recv().await;
+                        if frame.header.command == CMD_FIN {
+                            write_incoming.shutdown().await?;
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                        let queue_delay = buffer_recv.queue_delay().unwrap();
+                        tracing::trace!(
+                            stream_id,
+                            queue_delay = debug(queue_delay),
+                            remote_window,
+                            target_remote_window,
+                            "queue delay measured"
+                        );
+                        bw_estimate.sample(frame.body.len());
+                        write_incoming
+                            .write_all(&frame.body)
+                            .await
+                            .context("could not write to incoming")?;
+                        remote_window -= 1;
+
+                        // assume the delay is 1s, very generously
+                        if debloat.load(Ordering::Relaxed) {
+                            target_remote_window = ((bw_estimate.read() / MSS as f64 * 1.0)
+                                as usize)
+                                .clamp(INIT_WINDOW, MAX_WINDOW);
+                            tracing::debug!(
+                                target_remote_window,
+                                "setting target remote send window based on bw"
+                            );
+                        }
+
+                        if remote_window + min_quantum <= target_remote_window {
+                            let quantum = target_remote_window - remote_window;
+                            outgoing.enqueue(Frame::new(
+                                stream_id,
+                                CMD_MORE,
+                                &(quantum as u16).to_le_bytes(),
+                            ));
+                            tracing::debug!(
+                                stream_id,
+                                remote_window,
+                                target_remote_window,
+                                quantum,
+                                queue_delay = debug(queue_delay),
+                                "sending MORE"
+                            );
+                            remote_window += quantum;
+                        }
+                    }
+                };
+                let dropped = async {
+                    let _ = closed.await;
+                    Ok::<_, anyhow::Error>(())
+                };
+                (receive, dropped).race().await?;
+
+                // MORE frames must still find the send window after remote EOF.
+                // Keep the table entry until the send direction also finishes.
+                Ok::<_, anyhow::Error>(buffer_recv)
+            }
+        };
+
+        let send_task = {
+            let buffer_table = buffer_table.clone();
+            let outgoing = outgoing.clone();
+            async move {
+                while let Some(body) = pooled_read(&mut read_outgoing, MSS)
+                    .await
+                    .context("could not read_outgoing")?
+                {
+                    tracing::trace!(
+                        stream_id,
+                        n = body.len(),
+                        "sending outgoing data into channel"
+                    );
+                    let frame = Frame {
+                        header: Header {
+                            version: 1,
+                            command: CMD_PSH,
+                            body_len: body.len() as _,
+                            stream_id,
+                        },
+                        body,
+                    };
+                    buffer_table.wait_send_window(stream_id).await;
+                    outgoing.send(frame).await?;
+                }
+                outgoing.enqueue(Frame::new_empty(stream_id, CMD_FIN));
+                let _ = shutdown_send.send(());
+                Ok::<_, anyhow::Error>(())
+            }
+        };
+
+        {
+            let outgoing = outgoing.clone();
+            reaper.attach(spawn(async move {
+                if let Err(error) = futures_util::future::try_join(send_task, receive_task).await {
+                    outgoing.enqueue(Frame::new_empty(stream_id, CMD_FIN));
+                    tracing::debug!(stream_id, ?error, "stream stopped");
+                }
+            }));
+        }
+        stream
+    };
+
+    // receive open requests
+    let open_req_loop = async {
+        loop {
+            let (metadata, request) = recv_open_req.recv().await.map_err(|_e| {
+                std::io::Error::new(ErrorKind::BrokenPipe, "open request channel died")
+            })?;
+            let stream_id = {
+                let mut rng = rand::rng();
+                std::iter::repeat_with(|| rng.random())
+                    .find(|key| !buffer_table.is_reserved(*key))
+                    .unwrap()
+            };
+            outgoing.enqueue(Frame::new_empty(stream_id, CMD_SYN).tap_mut(|f| {
+                f.body = metadata.clone();
+                f.header.body_len = metadata.len() as _;
+            }));
+            let stream = create_stream(stream_id, metadata);
+
+            let _ = request.send(stream);
+        }
+    };
+
+    // process pings
+    let ping_loop = async {
+        let mut lc: Option<LivenessConfig> = None;
+        loop {
+            let tick = async {
+                if let Some(lc) = lc {
+                    tokio::time::sleep(lc.ping_interval).await;
+                    Ok(lc)
+                } else {
+                    futures_util::future::pending().await
+                }
+            };
+            if let Ok(info) = (tick, recv_liveness.recv()).race().await {
+                lc = Some(info);
+                let ping_body = serde_json::to_vec(&PingInfo {
+                    next_ping_in_ms: info.ping_interval.as_millis() as _,
+                })
+                .unwrap();
+                outgoing.enqueue(Frame {
+                    header: Header {
+                        version: 1,
+                        command: CMD_PING,
+                        body_len: ping_body.len() as _,
+                        stream_id: 0,
+                    },
+                    body: ping_body.into(),
+                });
+                let start = Instant::now();
+                if recv_pong.recv().timeout(info.timeout).await.is_none() {
+                    return Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "ping-pong timed out",
+                    ));
+                }
+                tracing::info!(latency = debug(start.elapsed()), "PONG received");
+                last_ping.lock().replace(start.elapsed());
+            } else {
+                return futures_util::future::pending().await;
+            }
+        }
+    };
+
+    let read_loop = async {
+        loop {
+            let frame = Frame::read(&mut inner_read).await?;
+            let stream_id = frame.header.stream_id;
+            tracing::trace!(
+                command = frame.header.command,
+                stream_id,
+                body_len = frame.header.body_len,
+                "got incoming frame"
+            );
+            match frame.header.command {
+                CMD_SYN => {
+                    if buffer_table.is_reserved(stream_id) {
+                        return Err(std::io::Error::new(ErrorKind::InvalidData, "duplicate SYN"));
+                    }
+                    let stream = create_stream(stream_id, frame.body.clone());
+                    if let Err(err) = send_accepted.try_send(stream) {
+                        match err {
+                            async_channel::TrySendError::Full(_) => {
+                                tracing::warn!("receive queue is empty, ignoring SYN");
+                            }
+                            async_channel::TrySendError::Closed(_) => {
+                                return Err(std::io::Error::new(ErrorKind::NotConnected, "dead"));
+                            }
+                        }
+                    }
+                }
+                CMD_MORE => {
+                    let window_increase =
+                        u16::from_le_bytes((&frame.body[..]).try_into().ok().ok_or_else(|| {
+                            std::io::Error::new(
+                                ErrorKind::InvalidData,
+                                "corrupt window increase message",
+                            )
+                        })?);
+                    buffer_table.incr_send_window(stream_id, window_increase);
+                }
+                CMD_PSH | CMD_FIN => {
+                    if frame.header.command == CMD_FIN {
+                        tracing::debug!(stream_id, "FIN received");
+                    }
+                    buffer_table.send_to(stream_id, frame);
+                }
+
+                CMD_NOP => {}
+                CMD_PING => {
+                    let ping_info: PingInfo = serde_json::from_slice(&frame.body).map_err(|e| {
+                        std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            format!("invalid PING data {e}"),
+                        )
+                    })?;
+                    tracing::debug!(
+                        next_ping_in_ms = ping_info.next_ping_in_ms,
+                        "responding to a PING"
+                    );
+
+                    outgoing.enqueue(Frame::new_empty(0, CMD_PONG))
+                }
+                CMD_PONG => {
+                    let _ = send_pong.send(()).await;
+                }
+                other => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("invalid command {other}"),
+                    ));
+                }
+            }
+        }
+    };
+    let result = (open_req_loop, ping_loop, read_loop).race().await;
+    if let Err(e) = &result {
+        tracing::warn!(
+            err = %e,
+            "MUX-DIED"
+        );
+    }
+    result
+}
+
+/// A bidirectional stream with independent read and write shutdown.
+///
+/// `AsyncWriteExt::shutdown` queues all buffered writes followed by FIN. The
+/// read direction remains usable until the peer closes its write direction.
+/// Peers must also support half-close to send a response after receiving EOF.
+#[pin_project]
+pub struct Stream {
+    #[pin]
+    shutdown: oneshot::Receiver<()>,
+    shutdown_complete: bool,
+    _closed: oneshot::Sender<()>,
+    #[pin]
+    read_incoming: tokio::io::DuplexStream,
+    #[pin]
+    write_outgoing: tokio::io::DuplexStream,
+    metadata: Bytes,
+    on_write: Box<dyn Fn(usize) + Send + Sync + 'static>,
+    on_read: Box<dyn Fn(usize) + Send + Sync + 'static>,
+}
+
+impl Debug for Stream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        "stream".fmt(f)
+    }
+}
+
+impl Stream {
+    pub fn metadata(&self) -> &[u8] {
+        &self.metadata
+    }
+
+    pub fn set_on_write(&mut self, on_write: impl Fn(usize) + Send + Sync + 'static) {
+        self.on_write = Box::new(on_write);
+    }
+
+    pub fn set_on_read(&mut self, on_read: impl Fn(usize) + Send + Sync + 'static) {
+        self.on_read = Box::new(on_read);
+    }
+}
+
+impl AsyncRead for Stream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.project();
+        let before = buf.filled().len();
+        match this.read_incoming.poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                let n = buf.filled().len() - before;
+                if n > 0 {
+                    (this.on_read)(n);
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl AsyncWrite for Stream {
+    #[tracing::instrument(name = "picomux_stream_write", skip(self, cx, buf))]
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        tracing::trace!(buf_len = buf.len(), "about to poll write");
+        let this = self.project();
+        match this.write_outgoing.poll_write(cx, buf) {
+            Poll::Ready(Ok(n)) => {
+                if n > 0 {
+                    (this.on_write)(n);
+                }
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.project().write_outgoing.poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let mut this = self.project();
+        std::task::ready!(this.write_outgoing.as_mut().poll_shutdown(cx))?;
+        if *this.shutdown_complete {
+            return Poll::Ready(Ok(()));
+        }
+        match std::task::ready!(this.shutdown.poll(cx)) {
+            Ok(()) => {
+                *this.shutdown_complete = true;
+                Poll::Ready(Ok(()))
+            }
+            Err(_) => Poll::Ready(Err(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "stream closed before writes drained",
+            ))),
+        }
+    }
+}
+
+impl sillad::Pipe for Stream {
+    fn protocol(&self) -> &str {
+        "sillad-stream"
+    }
+
+    fn remote_addr(&self) -> Option<&str> {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use geph5_rt::block_on;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tracing_test::traced_test;
+
+    async fn setup_picomux_pair() -> (PicoMux, PicoMux) {
+        let (a_write, b_read) = tokio::io::duplex(1);
+        let (b_write, a_read) = tokio::io::duplex(1);
+
+        let picomux_a = PicoMux::new(a_read, a_write);
+        let picomux_b = PicoMux::new(b_read, b_write);
+
+        (picomux_a, picomux_b)
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_picomux_basic() {
+        block_on(async move {
+            let (picomux_a, picomux_b) = setup_picomux_pair().await;
+
+            let a_proc = async move {
+                let mut stream_a = picomux_a.open(b"").await.unwrap();
+                stream_a.write_all(b"Hello, world!").await.unwrap();
+                stream_a.flush().await.unwrap();
+                drop(stream_a);
+                futures_util::future::pending::<()>().await
+            };
+            let b_proc = async move {
+                let mut stream_b = picomux_b.accept().await.unwrap();
+
+                let mut buf = vec![0u8; 13];
+                stream_b.read_exact(&mut buf).await.unwrap();
+
+                assert_eq!(buf, b"Hello, world!");
+            };
+            (a_proc, b_proc).race().await
+        })
+    }
+}

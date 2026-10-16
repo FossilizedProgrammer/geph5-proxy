@@ -1,0 +1,14 @@
+[package]
+name = "sillad-substitution"
+edition = "2024"
+version = "0.1.0"
+description = "A silly substitution cipher obfuscation protocol within the sillad framework"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+pin-project = "1.1.13"
+sillad = { version = "0.3.3", path = "../sillad" }
+geph5-rt = { version = "0.3.8", path = "../geph5-rt" }
+tokio = { version = "1.53", features = ["io-util"] }
